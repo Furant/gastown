@@ -67,6 +67,9 @@ type Daemon struct {
 	// mayor/daemon.json. Checked by isPatrolActive alongside patrolConfig.
 	disabledPatrols map[string]bool
 
+	// Prevent a slow runtime recovery from overlapping or blocking heartbeats.
+	runtimeFailoverMu sync.Mutex
+
 	// Mass death detection: track recent session deaths
 	deathsMu     sync.Mutex
 	recentDeaths []sessionDeath
@@ -717,6 +720,10 @@ func (d *Daemon) Run() (err error) {
 		d.logger.Printf("Quota dog ticker started (interval %v)", interval)
 	}
 
+	// Keep this cheap ticker active so an opt-in policy can be enabled at runtime.
+	runtimeFailoverTicker := time.NewTicker(runtimeFailoverInterval)
+	defer runtimeFailoverTicker.Stop()
+
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
 	// Global pane-died hooks don't fire reliably in tmux 3.2a, so we rely on the
 	// per-session approach which has been tested to work for continuous recovery.
@@ -817,6 +824,11 @@ func (d *Daemon) Run() (err error) {
 			// rig's main branch to catch regressions from merges or direct pushes.
 			if !d.isShutdownInProgress() {
 				d.runMainBranchTests()
+			}
+
+		case <-runtimeFailoverTicker.C:
+			if !d.isShutdownInProgress() {
+				d.runRuntimeFailover()
 			}
 
 		case <-quotaDogChan:
@@ -3095,4 +3107,20 @@ func (d *Daemon) dispatchQueuedWork() {
 	} else if len(out) > 0 {
 		d.logger.Printf("Scheduler dispatch: %s", string(out))
 	}
+}
+
+// runRuntimeFailover keeps provider recovery outside the heartbeat goroutine.
+func (d *Daemon) runRuntimeFailover() {
+	if !d.runtimeFailoverMu.TryLock() {
+		return
+	}
+	go func() {
+		defer d.runtimeFailoverMu.Unlock()
+		out, err := runRuntimeFailoverCycle(d.ctx, d.config.TownRoot, d.gtPath)
+		if err != nil {
+			d.logger.Printf("runtime-failover: %v", err)
+		} else if out != "" {
+			d.logger.Printf("runtime-failover: %s", out)
+		}
+	}()
 }

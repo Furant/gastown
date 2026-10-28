@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/runtimefailover"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 )
 
@@ -42,6 +43,9 @@ const CurrentTownSettingsVersion = 1
 type TownSettings struct {
 	Type    string `json:"type"`    // "town-settings"
 	Version int    `json:"version"` // schema version
+
+	// RuntimeFailover redirects a selected runtime after a quota failure.
+	RuntimeFailover *runtimefailover.Config `json:"runtime_failover,omitempty"`
 
 	// CLITheme controls CLI output color scheme.
 	// Values: "dark", "light", "auto" (default).

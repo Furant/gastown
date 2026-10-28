@@ -1128,7 +1128,7 @@ func SaveTownSettings(path string, settings *TownSettings) error {
 func ResolveAgentConfig(townRoot, rigPath string) *RuntimeConfig {
 	resolveConfigMu.Lock()
 	defer resolveConfigMu.Unlock()
-	return resolveAgentConfigInternal(townRoot, rigPath)
+	return routeResolvedAgentBestEffort(townRoot, rigPath, resolveAgentConfigInternal(townRoot, rigPath))
 }
 
 // resolveAgentConfigInternal is the lock-free version of ResolveAgentConfig.
@@ -1183,7 +1183,15 @@ func resolveAgentConfigInternal(townRoot, rigPath string) *RuntimeConfig {
 func ResolveAgentConfigWithOverride(townRoot, rigPath, agentOverride string) (*RuntimeConfig, string, error) {
 	resolveConfigMu.Lock()
 	defer resolveConfigMu.Unlock()
-	return resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride)
+	rc, agent, err := resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride)
+	if err != nil {
+		return nil, agent, err
+	}
+	if agent == "" && rc != nil {
+		agent = rc.ResolvedAgent
+	}
+	rc, agent, err = routeResolvedAgent(townRoot, rigPath, agent, rc)
+	return rc, agent, err
 }
 
 // resolveAgentConfigWithOverrideInternal is the lock-free version.
@@ -1352,6 +1360,7 @@ func ResolveRoleAgentConfig(role, townRoot, rigPath string) *RuntimeConfig {
 	resolveConfigMu.Lock()
 	defer resolveConfigMu.Unlock()
 	rc := resolveRoleAgentConfigCore(role, townRoot, rigPath)
+	rc = routeResolvedAgentBestEffort(townRoot, rigPath, rc)
 	return withRoleSettingsFlag(rc, role, rigPath)
 }
 
@@ -1395,7 +1404,7 @@ func ResolveWorkerAgentConfig(workerName, townRoot, rigPath string) *RuntimeConf
 				_ = LoadAgentRegistry(DefaultAgentRegistryPath(townRoot))
 				_ = LoadRigAgentRegistry(RigAgentRegistryPath(rigPath))
 				if rc := tryResolveNamedAgent(agentName, fmt.Sprintf("worker_agents[%s]", workerName), townSettings, rigSettings); rc != nil {
-					return withRoleSettingsFlag(rc, "crew", rigPath)
+					return withRoleSettingsFlag(routeResolvedAgentBestEffort(townRoot, rigPath, rc), "crew", rigPath)
 				}
 			}
 		}
@@ -1415,7 +1424,7 @@ func ResolveWorkerAgentConfig(workerName, townRoot, rigPath string) *RuntimeConf
 					_ = LoadRigAgentRegistry(RigAgentRegistryPath(rigPath))
 				}
 				if rc := tryResolveNamedAgent(agentName, fmt.Sprintf("crew_agents[%s]", workerName), townSettings, rigSettings); rc != nil {
-					return withRoleSettingsFlag(rc, "crew", rigPath)
+					return withRoleSettingsFlag(routeResolvedAgentBestEffort(townRoot, rigPath, rc), "crew", rigPath)
 				}
 			}
 		}
@@ -1423,7 +1432,7 @@ func ResolveWorkerAgentConfig(workerName, townRoot, rigPath string) *RuntimeConf
 
 	// Tier 3: fall back to crew role resolution (already holds lock; use core function)
 	rc := resolveRoleAgentConfigCore("crew", townRoot, rigPath)
-	return withRoleSettingsFlag(rc, "crew", rigPath)
+	return withRoleSettingsFlag(routeResolvedAgentBestEffort(townRoot, rigPath, rc), "crew", rigPath)
 }
 
 // ResolveRoleEffort resolves the effort level for a role.
@@ -2501,6 +2510,10 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		}
 	}
 
+	if err := ValidateRuntimeFailoverResolution(townRoot, rigPath, rc); err != nil {
+		return "", fmt.Errorf("runtime failover resolution: %w", err)
+	}
+
 	// Ensure Claude agents get --settings when their settings directory
 	// differs from the session working directory. This must run for ALL
 	// resolution paths (including agent overrides) — previously only the
@@ -2526,13 +2539,17 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		resolvedEnv["GT_SESSION_ID_ENV"] = rc.Session.SessionIDEnv
 	}
 	// Record agent name so IsAgentAlive can detect the running process.
-	// Explicit override takes priority; fall back to resolved agent name.
+	// Use the resolved alias as the source of truth. Routing may have redirected
+	// an explicit source override to another runtime; exporting the original
+	// override here would misidentify the process and trigger duplicate recovery.
 	agentForProcess := rc.ResolvedAgent
-	if agentOverride != "" {
-		resolvedEnv["GT_AGENT"] = agentOverride
-		agentForProcess = agentOverride
-	} else if rc.ResolvedAgent != "" {
-		resolvedEnv["GT_AGENT"] = rc.ResolvedAgent
+	if agentForProcess == "" && agentOverride != "" {
+		if parts := strings.Fields(agentOverride); len(parts) > 0 {
+			agentForProcess = parts[0]
+		}
+	}
+	if agentForProcess != "" {
+		resolvedEnv["GT_AGENT"] = agentForProcess
 	}
 	// Set GT_PROCESS_NAMES for accurate liveness detection of custom agents.
 	// Pass rc.Args so wrapper-unwrap (env/sudo/nohup wrapping a real binary)

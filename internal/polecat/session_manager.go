@@ -386,6 +386,10 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	}
 
+	if err := config.ValidateRuntimeFailoverResolution(townRoot, m.rig.Path, runtimeConfig); err != nil {
+		return fmt.Errorf("runtime failover resolution: %w", err)
+	}
+
 	// Ensure runtime settings exist in the shared polecats parent directory.
 	// Settings are passed to Claude Code via --settings flag.
 	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)

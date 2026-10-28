@@ -168,6 +168,10 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		runtimeConfig = rc
 	}
 
+	if err := config.ValidateRuntimeFailoverResolution(cfg.TownRoot, cfg.RigPath, runtimeConfig); err != nil {
+		return nil, fmt.Errorf("runtime failover resolution: %w", err)
+	}
+
 	// 2. Ensure settings/plugins exist for the agent.
 	settingsDir := config.RoleSettingsDir(cfg.Role, cfg.RigPath)
 	if settingsDir == "" {
@@ -200,16 +204,7 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	// session creation only affects newly spawned panes — the running pane
 	// (and any subprocess the agent spawns, e.g. bd) keeps its original
 	// environment (gt-neycp).
-	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:             cfg.Role,
-		Rig:              cfg.RigName,
-		AgentName:        cfg.AgentName,
-		TownRoot:         cfg.TownRoot,
-		RuntimeConfigDir: cfg.RuntimeConfigDir,
-		Agent:            cfg.AgentOverride,
-		SessionName:      cfg.SessionID,
-	})
-	envVars = MergeRuntimeLivenessEnv(envVars, runtimeConfig)
+	envVars := runtimeSessionEnv(cfg, runtimeConfig)
 	envVars["GT_RUN"] = runID
 	for k, v := range cfg.ExtraEnv {
 		envVars[k] = v
@@ -375,6 +370,21 @@ func StopSession(t *tmux.Tmux, sessionID string, graceful bool) error {
 	}
 
 	return nil
+}
+
+// runtimeSessionEnv records the runtime that actually launches. An explicit
+// alias may have been redirected by a persisted usage-limit failover.
+func runtimeSessionEnv(cfg SessionConfig, rc *config.RuntimeConfig) map[string]string {
+	agent := cfg.AgentOverride
+	if rc != nil && rc.ResolvedAgent != "" {
+		agent = rc.ResolvedAgent
+	}
+	env := config.AgentEnv(config.AgentEnvConfig{
+		Role: cfg.Role, Rig: cfg.RigName, AgentName: cfg.AgentName,
+		TownRoot: cfg.TownRoot, RuntimeConfigDir: cfg.RuntimeConfigDir,
+		Agent: agent, SessionName: cfg.SessionID,
+	})
+	return MergeRuntimeLivenessEnv(env, rc)
 }
 
 func mapKeysSorted(m map[string]string) []string {
