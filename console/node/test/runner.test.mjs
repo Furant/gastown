@@ -35,6 +35,28 @@ test('approved execution emits a final event and same task resume retains worktr
   assert.ok(x.events.some(e=>e.type==='completed'));
 });
 
+test('local execution is bound to this node and attaches a human review snapshot',async t=>{
+  const x=await setup(t,{type:'item.completed',item:{type:'agent_message',text:'Feature complete'}},{ensureWorktreeImpl:async(...args)=>{const worktree=await ensureWorktree(...args);await fs.writeFile(path.join(worktree.path,'README.md'),'tracked-review-change\nAPI_KEY=fake-local-secret\n');await fs.writeFile(path.join(worktree.path,'new-review.txt'),'untracked-review-change\n');return worktree}});
+  x.runner.config.nodeId='fixture-node';
+  const reviewJob=job({repoType:'local',localPath:await fs.realpath(x.repo),localNodeId:'fixture-node'});
+  const result=await x.runner.run(reviewJob),completed=x.events.find(event=>event.type==='completed');
+  assert.equal(result.status,'completed');assert.equal(completed.data.localReview.worktreePath,await fs.realpath(result.worktree.path));
+  assert.ok(completed.data.localReview.files.some(file=>file.path==='README.md'));assert.ok(completed.data.localReview.files.some(file=>file.path==='new-review.txt'));
+  assert.match(completed.data.localReview.diff,/tracked-review-change/);assert.match(completed.data.localReview.diff,/untracked-review-change/);assert.equal(completed.data.localReview.diff.includes('fake-local-secret'),false);
+  assert.equal(await fs.readFile(path.join(x.repo,'README.md'),'utf8'),'base');
+  await assert.rejects(x.runner.run(job({taskId:'wrong-node-task',attemptId:'wrong-node-attempt',repoType:'local',localPath:x.repo,localNodeId:'remote-node'})),/bound local node/i);
+  assert.equal(x.events.some(event=>event.attemptId==='wrong-node-attempt'&&event.type==='completed'),false);
+});
+
+test('local execution rejects remote delivery and checkpoint metadata before spawn',async t=>{
+  const x=await setup(t,{type:'result',result:'never launched'});let launches=0;
+  const original=x.runner.spawnImpl;x.runner.spawnImpl=(...args)=>{launches++;return original(...args)};x.runner.config.nodeId='fixture-node';
+  const local={repoType:'local',localPath:await fs.realpath(x.repo),localNodeId:'fixture-node'};
+  await assert.rejects(x.runner.run(job({...local,allowPush:true,taskId:'push-task',attemptId:'push-attempt'})),/local project cannot push or create pull requests/i);
+  await assert.rejects(x.runner.run(job({...local,taskId:'checkpoint-task',attemptId:'checkpoint-attempt',checkpoint:{checkpointId:'remote-checkpoint'}})),/cannot run on a local project/i);
+  assert.equal(launches,0);
+});
+
 test('PR completion is reported only with verified URL evidence',async t=>{
   const url='https://github.com/team/repo/pull/12',x=await setup(t,{type:'result',result:'PR created'}, {verifyPullRequestImpl:async()=>url});
   const result=await x.runner.run(job({allowPush:true,allowPR:true}));assert.equal(result.prUrl,url);assert.equal(x.events.find(event=>event.type==='completed').data.prUrl,url);

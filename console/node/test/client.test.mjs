@@ -24,6 +24,12 @@ test('poll sends available capacity so the server never leases work the node can
   await client.poll({capacity:0});assert.deepEqual(body,{capacity:0});
 });
 
+test('pair confirmation uses the authenticated worker route and does not log code in errors',async()=>{
+  let request;const client=new WorkerClient({serverUrl:'https://console.example',token:fixtureToken,fetchImpl:async(url,init)=>{request={url,init};return{ok:true,json:async()=>({data:{paired:true,nodeId:'node-1'}})}}});
+  assert.deepEqual(await client.pair('pair-code-123'),{paired:true,nodeId:'node-1'});
+  assert.equal(request.url,'https://console.example/api/v1/worker/pair');assert.deepEqual(JSON.parse(request.init.body),{code:'pair-code-123'});
+});
+
 test('checkpoint upload and target read use the authenticated worker routes with transfer timeout',async()=>{
   const requests=[];const client=new WorkerClient({serverUrl:'http://localhost:8768',token:'node-secret',fetchImpl:async(url,init)=>{requests.push({url,init});return{ok:true,json:async()=>({data:{checkpointId:'checkpoint-1',digest:'a'.repeat(64),envelope:{version:1}}})}}});
   const upload={attemptId:'a',leaseToken:'l',transferId:'t',envelope:{version:1}};await client.uploadCheckpoint(upload);await client.readCheckpoint('checkpoint-1',{attemptId:'b',leaseToken:'m'});

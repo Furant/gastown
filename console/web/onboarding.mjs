@@ -16,6 +16,18 @@ export function isControlPlaneUrlAllowed(value) {
   }
 }
 
+export function getLocalDeviceSecret(storage = globalThis.localStorage, cryptoApi = globalThis.crypto) {
+  const key = 'gastown.local-device.v1';
+  let value;
+  try { value = storage?.getItem(key); } catch { value = ''; }
+  if (typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)) return value;
+  if (!cryptoApi?.getRandomValues) throw new Error('此浏览器无法生成安全的本机配对凭据。');
+  const bytes = cryptoApi.getRandomValues(new Uint8Array(32));
+  value = [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('');
+  try { storage?.setItem(key, value); } catch { /* Keep this browser-session key in memory when storage is unavailable. */ }
+  return value;
+}
+
 export function buildNodeConfig({ serverUrl, projects, cliPaths }) {
   return {
     serverUrl: String(serverUrl ?? '').trim(),

@@ -1,4 +1,5 @@
 import { denied } from './errors.mjs';
+import { requireLocalProjectDevice } from './local-projects.mjs';
 const values=value=>Array.isArray(value)?value:typeof value==='string'?JSON.parse(value||'[]'):[];
 export const asArray=values;
 export function inScope(resource,user,teams) {
@@ -10,7 +11,7 @@ export function inScope(resource,user,teams) {
 }
 export async function requireProject(db,user,projectId) {
  const {rows}=await db.query('SELECT * FROM projects WHERE id=$1 AND org_id=$2',[projectId,user.org_id]);
- const project=rows[0];if(!project)denied();
+ const project=rows[0];if(!project)denied();await requireLocalProjectDevice(db,user,project);
  const {rows:members}=await db.query('SELECT team_id FROM team_members WHERE user_id=$1',[user.id]);
  if(!inScope(project,user,new Set(members.map(x=>x.team_id))))denied();
  return project;

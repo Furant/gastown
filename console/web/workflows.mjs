@@ -60,3 +60,17 @@ export function validateBudget(values) {
 export function taskLifecycleActionsFor(task) {
   return task?.status === 'recovery_required' ? [] : taskLifecycleActions(task?.status);
 }
+
+export function localProjectConnections(project, connections, nodes, userId) {
+  if (project?.repoType !== 'local' || !project.localNodeId || !userId || project.ownerId !== userId) return [];
+  const node = nodes.find(item => item.id === project.localNodeId && item.ownerId === userId && item.pairedToThisDevice);
+  if (!node) return [];
+  return connections.filter(item => item.nodeId === node.id && item.ownerId === userId && item.projectIds?.includes(project.id));
+}
+
+export function cursorFileUrl(path) {
+  if (typeof path !== 'string' || path.length > 2048 || /[\u0000-\u001f\u007f]/.test(path)) return '';
+  const absolute = path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path);
+  if (!absolute) return '';
+  return `cursor://file/${encodeURI(path).replace(/#/g, '%23').replace(/\?/g, '%3F')}`;
+}

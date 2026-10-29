@@ -71,6 +71,16 @@ Use the actual base branch of the local repository. Login to each CLI on the exe
 
 One node uses one local OS identity and its tool logins. Only its owner creates connections on it; teammates use explicitly shared connections. To host members' separate private tool accounts on a shared server, run separate node processes under separate OS users/isolated homes and repository access. Sharing a server entry in the console does not create OS isolation or independent provider logins. Node protocol/HTTP authorization cannot substitute for this boundary.
 
+## Private local development
+
+Private projects can use a local Git directory instead of a GitHub URL. Here, local means your own development computer, even when the console is hosted on a team server. Register a node first, choose its pairing action in the browser, and run the displayed `--pair` command on that computer using its protected node configuration. Pairing codes expire after five minutes and can be used once. This explicitly associates the node with this browser's device secret; it is an operator-selected machine binding, not hardware attestation. Keep node credentials on that machine. Copying a node's credentials to another machine defeats that binding.
+
+Create the local project with its absolute Git root, base branch and paired node. Download or update the node configuration to map the new project ID to that same directory, then restart the worker. Directory existence, Git root and base branch are checked on the node before launching a tool. The console never opens that path on its server. The directory must already be a Git repository; the worker does not initialize or reset it.
+
+Local projects stay private and execute only on the bound owner node. Tool switching can use another authorized connection on that same node. Other nodes cannot receive those tasks or encrypted checkpoints, and an offline local node leaves work waiting. Local project tasks cannot authorize automatic commits, pushes or PRs.
+
+Execution preserves an isolated task worktree. The task detail shows its path, a copy action, a Cursor opening link and a bounded changed-file/diff report. Open that task directory in your IDE to inspect, edit and test the result; the source checkout remains unchanged. Sensitive, binary and symlink content is omitted from the web report, and truncation is marked. Review the complete worktree locally before deciding to merge, commit or push. Reported tool summaries are not independent proof that tests passed. Local review content and paths are restricted to the owner and paired browser. Keep browser storage available; losing the device secret may require recreating the binding rather than silently moving an existing local project.
+
 ## Task lifecycle and sharing
 
 Connections and projects start private. Owners may separately share them with a team or explicit members. A user needs project, node and connection access; sharing a task alone grants no tool credentials. Configure a connection only after its node reports tool models. Models and reasoning modes are validated against the connection's catalog and owner restrictions. Attempts snapshot their configuration.

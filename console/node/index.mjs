@@ -9,13 +9,20 @@ import { resolveProject } from './workspace.mjs';
 import { ensureNodeCheckpointKeys } from './checkpoint.mjs';
 import { recoverJournals, acquireNodeLock } from './journal.mjs';
 
-export function parseArgs(args){let configPath,once=false,check=false;for(let i=0;i<args.length;i++){if(args[i]==='--help'||args[i]==='-h')return{help:true};if(args[i]==='--config')configPath=args[++i];else if(args[i]==='--once')once=true;else if(args[i]==='--check')check=true;else throw new Error(`Unknown argument: ${args[i]}`)}if(!configPath)throw new Error('Usage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check]');if(once&&check)throw new Error('--once and --check cannot be combined');return{configPath,once,check}}
+export function parseArgs(args){let configPath,once=false,check=false,pair=false;for(let i=0;i<args.length;i++){if(args[i]==='--help'||args[i]==='-h')return{help:true};if(args[i]==='--config')configPath=args[++i];else if(args[i]==='--once')once=true;else if(args[i]==='--check')check=true;else if(args[i]==='--pair')pair=true;else throw new Error(`Unknown argument: ${args[i]}`)}if(!configPath)throw new Error('Usage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check|--pair]');if(once&&check||pair&&(once||check))throw new Error('--pair, --once and --check cannot be combined');return{configPath,once,check,...(pair?{pair:true}:{})}}
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
 function capabilityViews(capabilities){
   const list=Array.isArray(capabilities?.tools)?capabilities.tools:Object.entries(capabilities?.tools||{}).map(([tool,value])=>({tool,models:value?.models||[]}));
   const map={};for(const tool of list)map[tool.tool]={models:tool.models||[]};
   return {reported:{tools:list},runner:{tools:map}};
+}
+export async function pairNode(client,{code,logger=console}={}){
+  if(typeof code!=='string'||code.trim().length<12||code.length>256)throw new Error('A valid pairing code is required');
+  const result=await client.pair(code.trim());
+  if(!result?.paired)throw new Error('The node was not paired; check that the code is current and matches this node');
+  logger.log('Local node paired successfully. Return to the console to create a private local project.');
+  return result;
 }
 export async function checkNode(config,{client=new WorkerClient(config),capabilities,logger=console}={}){
   const checkpointKeys=await ensureNodeCheckpointKeys(config);
@@ -24,7 +31,7 @@ export async function checkNode(config,{client=new WorkerClient(config),capabili
   for(const [tool,entry] of configured){const executable=await fs.realpath(entry.command).catch(()=>{throw new Error(`${tool} executable does not exist: ${entry.command}`)});await fs.access(executable,fsConstants.X_OK).catch(()=>{throw new Error(`${tool} executable is not runnable: ${executable}`)})}
   const views=capabilityViews(capabilities||await discoverCapabilities(config));
   for(const [tool] of configured)if(!views.runner.tools[tool]?.models?.length)throw new Error(`${tool} CLI is present, but no supported signed-in models were discovered`);
-  await client.heartbeat(views.reported,checkpointKeys.publicKey);
+  const heartbeat=await client.heartbeat(views.reported,checkpointKeys.publicKey);if(heartbeat?.node?.id)config.nodeId=heartbeat.node.id;
   logger.log(`Server authentication: OK (${config.serverUrl})`);for(const project of projects)logger.log(`Project ${project.id}: OK (${project.path}, ${project.baseBranch})`);for(const [tool] of configured)logger.log(`${tool}: OK (${views.runner.tools[tool].models.length} supported models)`);
   return {serverUrl:config.serverUrl,projects,tools:views.runner.tools};
 }
@@ -50,7 +57,7 @@ export async function startNode(config,{once=false,client:providedClient,capabil
     let nextHeartbeat=0,nextCapabilityRefresh=Date.now()+300000;
     do{
       if(Date.now()>=nextCapabilityRefresh){try{const updated=capabilityViews(await discoverCapabilitiesImpl(config));views.reported=updated.reported;views.runner=updated.runner;runner.capabilities=updated.runner}catch(error){logger.error('capability refresh failed',error.message)}nextCapabilityRefresh=Date.now()+300000}
-      if(Date.now()>=nextHeartbeat){nextHeartbeat=Date.now()+15000;try{await client.heartbeat(views.reported,checkpointKeys.publicKey);consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}}
+      if(Date.now()>=nextHeartbeat){nextHeartbeat=Date.now()+15000;try{const heartbeat=await client.heartbeat(views.reported,checkpointKeys.publicKey);if(heartbeat?.node?.id)config.nodeId=heartbeat.node.id;consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}}
       const capacity=once?config.maxConcurrent:Math.max(0,config.maxConcurrent-Math.max(active.size,runner.running.size));
       let result;try{result=await client.poll({capacity});consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}
       for(const cancellation of result.cancellations||[]){
@@ -72,5 +79,5 @@ export async function startNode(config,{once=false,client:providedClient,capabil
 }
 
 if(import.meta.url===new URL(`file://${process.argv[1]}`).href){
-  try{const args=parseArgs(process.argv.slice(2));if(args.help)console.log('Gas Town team console execution node\n\nUsage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check]\n\nOptions:\n  --config PATH  Load this node\'s private JSON config (mode 0600)\n  --check        Validate paths and tools, discover models, and authenticate without claiming tasks\n  --once         Poll once, execute returned jobs, then exit\n  -h, --help     Show this help\n\nSet GAS_TOWN_NODE_TOKEN in the environment instead of storing a token in the config.');else{const config=await loadConfig(args.configPath);if(args.check)await checkNode(config);else await startNode(config,args)}}catch(error){console.error(error.message);process.exitCode=1}
+  try{const args=parseArgs(process.argv.slice(2));if(args.help)console.log('Gas Town team console execution node\n\nUsage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check|--pair]\n\nOptions:\n  --config PATH  Load this node\'s private JSON config (mode 0600)\n  --check        Validate paths and tools, discover models, and authenticate without claiming tasks\n  --once         Poll once, execute returned jobs, then exit\n  --pair         Pair this machine by entering a short-lived code from the authenticated console\n  -h, --help     Show this help\n\nSet GAS_TOWN_NODE_TOKEN in the environment instead of storing a token in a 0600 config.');else{const config=await loadConfig(args.configPath);if(args.check)await checkNode(config);else if(args.pair){const {createInterface}=await import('node:readline/promises');const readline=createInterface({input:process.stdin,output:process.stdout});try{const code=await readline.question('Pairing code (will be visible as typed): ');await pairNode(new WorkerClient(config),{code})}finally{readline.close()}}else await startNode(config,args)}}catch(error){console.error(error.message);process.exitCode=1}
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { checkpointTargetReady, formatRecordedCost, taskLifecycleActions, taskLifecycleActionsFor, validateBudget, validateChildren } from './workflows.mjs';
+import { checkpointTargetReady, cursorFileUrl, formatRecordedCost, localProjectConnections, taskLifecycleActions, taskLifecycleActionsFor, validateBudget, validateChildren } from './workflows.mjs';
 
 test('lifecycle controls follow task state and hide actions while stopping', () => {
   assert.deepEqual(taskLifecycleActions('running'), ['pause', 'cancel']);
@@ -50,4 +50,22 @@ test('budget limits are optional positive integers and enabled budgets need a li
   assert.match(validateBudget({ enabled: true, maxRunsPerDay: '' }), /至少填写一项/);
   assert.match(validateBudget({ enabled: true, maxInputTokens: '0' }), /大于 0 的整数/);
   assert.match(validateBudget({ enabled: true, maxOutputTokens: '1.5' }), /大于 0 的整数/);
+});
+
+test('local project connection and transfer options stay on the owner paired node', () => {
+  const project = { id: 'project-local', repoType: 'local', localNodeId: 'node-local', ownerId: 'owner' };
+  const connections = [
+    { id: 'local', ownerId: 'owner', nodeId: 'node-local', projectIds: ['project-local'] },
+    { id: 'unpaired', ownerId: 'owner', nodeId: 'node-other' },
+    { id: 'other-owner', ownerId: 'other', nodeId: 'node-local' },
+  ];
+  const nodes = [{ id: 'node-local', ownerId: 'owner', pairedToThisDevice: true }, { id: 'node-other', ownerId: 'owner', pairedToThisDevice: false }];
+  assert.deepEqual(localProjectConnections(project, connections, nodes, 'owner').map(x => x.id), ['local']);
+  assert.deepEqual(localProjectConnections(project, connections, nodes, 'other'), []);
+});
+
+test('Cursor review links accept absolute paths and reject URL injection', () => {
+  assert.equal(cursorFileUrl('/Users/alice/Project/src/app.js'), 'cursor://file//Users/alice/Project/src/app.js');
+  assert.equal(cursorFileUrl('javascript:alert(1)'), '');
+  assert.equal(cursorFileUrl('/tmp/bad\u0000path'), '');
 });

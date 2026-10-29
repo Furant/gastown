@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   buildNodeConfig,
   escapeHTML,
+  getLocalDeviceSecret,
   githubPrUrl,
   isAbsoluteNodePath,
   isControlPlaneUrlAllowed,
@@ -59,4 +60,15 @@ test('only accepts HTTPS GitHub PR URLs', () => {
   for (const url of ['http://github.com/a/b/pull/1', 'https://evil.example/github.com', 'https://github.com.evil.example/a/b', 'https://user@github.com/a/b/pull/1', 'https://github.com/a/b/issues/1', 'not a URL']) {
     assert.equal(githubPrUrl(url), null, url);
   }
+});
+
+test('local device credential persists securely generated random bytes and reuses only valid values', () => {
+  const values = new Map();
+  const storage = { getItem: key => values.get(key), setItem: (key, value) => values.set(key, value) };
+  const cryptoApi = { getRandomValues: bytes => { bytes.fill(42); return bytes; } };
+  const first = getLocalDeviceSecret(storage, cryptoApi);
+  assert.equal(first.length, 64);
+  assert.equal(getLocalDeviceSecret(storage, { getRandomValues: () => { throw new Error('must reuse'); } }), first);
+  values.set('gastown.local-device.v1', 'invalid');
+  assert.equal(getLocalDeviceSecret(storage, cryptoApi), first);
 });

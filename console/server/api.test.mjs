@@ -6,6 +6,7 @@ import { createApp } from './app.mjs';
 import { generateCheckpointKeys, sealCheckpoint, openCheckpoint } from '../shared/checkpoint-crypto.mjs';
 import { changePassword } from './member-admin.mjs';
 import { hashPassword } from './auth.mjs';
+import { validateLocalReview } from './local-projects.mjs';
 
 const fixtureCredentials = new Map();
 function fixturePassword(label) {
@@ -22,12 +23,13 @@ async function fixture() {
   return { db, app, base, close: async () => { await new Promise(r => app.close(r)); await db.close(); } };
 }
 
-async function req(f, path, {method='GET',body,token,cookie,csrf}={}) {
+async function req(f, path, {method='GET',body,token,cookie,csrf,device}={}) {
   const headers={};
   if(body!==undefined) headers['content-type']='application/json';
   if(token) headers.authorization=`Bearer ${token}`;
   if(cookie) headers.cookie=cookie;
   if(csrf) headers['x-csrf-token']=csrf;
+  if(device) headers['x-local-device']=device;
   if(['POST','PATCH','PUT','DELETE'].includes(method)) headers.origin=f.base;
   const res=await fetch(f.base+path,{method,headers,body:body===undefined?undefined:JSON.stringify(body),redirect:'manual'});
   const json=await res.json();
@@ -457,4 +459,57 @@ test('static web modules use a JavaScript MIME type with nosniff enabled',async 
  assert.equal(response.status,200);
  assert.match(response.headers.get('content-type'),/javascript/);
  assert.equal(response.headers.get('x-content-type-options'),'nosniff');
+});
+
+test('local Git projects require a paired private node and browser device, and stay bound to that node', async t => {
+  assert.throws(() => validateLocalReview({worktreePath:'file:///tmp/task',files:[],diff:'',diffTruncated:false,filesTruncated:false}));
+  assert.throws(() => validateLocalReview({worktreePath:'/tmp/task\nfile:///etc/passwd',files:[],diff:'',diffTruncated:false,filesTruncated:false}));
+  const f = await fixture(); t.after(f.close);
+  const boot = await req(f, '/api/v1/auth/bootstrap', {method:'POST', body:{organization:'Local',name:'Owner',email:'local@example.test',password:fixturePassword('local-device-password')}});
+  const auth = {cookie:boot.headers.get('set-cookie').split(';')[0],csrf:boot.json.data.csrfToken};
+  const device = randomBytes(32).toString('base64url'), otherDevice = randomBytes(32).toString('base64url');
+  const node = await req(f,'/api/v1/nodes',{method:'POST',...auth,device,body:{name:'My Mac',visibility:'private',projectIds:[]}});
+  assert.equal(node.status,201);
+  const pairing = await req(f,`/api/v1/nodes/${node.json.data.id}/pairing`,{method:'POST',...auth,device,body:{}});
+  assert.equal(pairing.status,201,JSON.stringify(pairing.json));
+  assert.equal(typeof pairing.json.data.code,'string');
+  const confirmed = await req(f,'/api/v1/worker/pair',{method:'POST',token:node.json.data.token,body:{code:pairing.json.data.code}});
+  assert.equal(confirmed.status,200,JSON.stringify(confirmed.json));
+  assert.equal(confirmed.json.data.paired,true);
+  assert.equal((await req(f,'/api/v1/worker/pair',{method:'POST',token:node.json.data.token,body:{code:pairing.json.data.code}})).status,404,'pairing codes are single use');
+  const listed = await req(f,'/api/v1/nodes',{...auth,device});
+  assert.equal(listed.json.data[0].pairedToThisDevice,true);
+  assert.equal(JSON.stringify(listed.json).includes('localDeviceHash'),false);
+  const local = await req(f,'/api/v1/projects',{method:'POST',...auth,device,body:{name:'Local repo',repoType:'local',localPath:'/Users/owner/src/repo',localNodeId:node.json.data.id,baseBranch:'main',visibility:'private'}});
+  assert.equal(local.status,201,JSON.stringify(local.json));
+  assert.deepEqual({repoType:local.json.data.repoType,localPath:local.json.data.localPath,localNodeId:local.json.data.localNodeId,visibility:local.json.data.visibility},{repoType:'local',localPath:'/Users/owner/src/repo',localNodeId:node.json.data.id,visibility:'private'});
+  const grants = (await f.db.query('SELECT project_ids FROM nodes WHERE id=$1',[node.json.data.id])).rows[0].project_ids;
+  assert.ok((Array.isArray(grants)?grants:JSON.parse(grants)).includes(local.json.data.id),'local project binding grants the chosen node access');
+  const wrongDevice = await req(f,'/api/v1/projects',{method:'POST',...auth,device:otherDevice,body:{name:'Wrong browser',repoType:'local',localPath:'/tmp/repo',localNodeId:node.json.data.id,baseBranch:'main',visibility:'private'}});
+  assert.equal(wrongDevice.status,403);
+  const shared = await req(f,'/api/v1/projects',{method:'POST',...auth,device,body:{name:'Shared local',repoType:'local',localPath:'/tmp/repo',localNodeId:node.json.data.id,baseBranch:'main',visibility:'team',teamId:(await req(f,'/api/v1/teams',{...auth})).json.data[0]?.id}});
+  assert.equal(shared.status,400);
+  const replayed = await req(f,`/api/v1/nodes/${node.json.data.id}/pairing`,{method:'POST',...auth,device,body:{}});
+  assert.equal(replayed.status,201);
+  const otherToken = await req(f,'/api/v1/worker/pair',{method:'POST',token:'gt_node_'+randomBytes(24).toString('hex'),body:{code:replayed.json.data.code}});
+  assert.equal(otherToken.status,401);
+  await req(f,'/api/v1/worker/heartbeat',{method:'POST',token:node.json.data.token,body:{capabilities:{tools:[{tool:'codex',models:[{id:'local-model',name:'Local Model',modes:['high'],nativeByMode:{high:'local-model'}}]}]}}});
+  const connection=await req(f,'/api/v1/connections',{method:'POST',...auth,device,body:{name:'Local Codex',nodeId:node.json.data.id,tool:'codex',visibility:'private',projectIds:[local.json.data.id],model:'local-model',mode:'high',allowedModels:['local-model'],allowOverride:false,maxConcurrency:1,allowAutoFailover:true}});
+  assert.equal(connection.status,400,'local connections cannot enable quota handoff');
+  const safeConnection=await req(f,'/api/v1/connections',{method:'POST',...auth,device,body:{name:'Local Codex',nodeId:node.json.data.id,tool:'codex',visibility:'private',projectIds:[local.json.data.id],model:'local-model',mode:'high',allowedModels:['local-model'],allowOverride:false,maxConcurrency:1}});
+  assert.equal(safeConnection.status,201,JSON.stringify(safeConnection.json));
+  const task=await req(f,'/api/v1/tasks',{method:'POST',...auth,device,body:{title:'Review local change',description:'Keep the task on this computer',projectId:local.json.data.id,connectionId:safeConnection.json.data.id}});
+  assert.equal(task.status,201,JSON.stringify(task.json));
+  const plan=await req(f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{capacity:1}});
+  assert.equal(plan.json.data.jobs[0].repoType,'local');assert.equal(plan.json.data.jobs[0].localPath,'/Users/owner/src/repo');assert.equal(plan.json.data.jobs[0].localNodeId,node.json.data.id);assert.equal(plan.json.data.jobs[0].allowPush,false);assert.equal(plan.json.data.jobs[0].allowPR,false);
+  const job=plan.json.data.jobs[0];
+  await req(f,'/api/v1/worker/events',{method:'POST',token:node.json.data.token,body:{attemptId:job.attemptId,leaseToken:job.leaseToken,type:'plan_ready',message:'plan',data:{summary:'review',steps:[{title:'Implement','acceptance':'Review'}]}}});
+  const deniedDelivery=await req(f,`/api/v1/tasks/${task.json.data.id}/approve`,{method:'POST',...auth,device,body:{allowPush:true,allowPR:false}});assert.equal(deniedDelivery.status,400);
+  await req(f,`/api/v1/tasks/${task.json.data.id}/approve`,{method:'POST',...auth,device,body:{allowPush:false,allowPR:false}});
+  const execute=(await req(f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{capacity:1}})).json.data.jobs[0];assert.equal(execute.kind,'execute');
+  const localReview={worktreePath:'/Users/owner/.gastown-console/worktrees/repo/task',files:[{path:'src/app.js',status:'modified'}],diff:'diff --git a/src/app.js b/src/app.js\n+change',diffTruncated:false,filesTruncated:false};
+  await req(f,'/api/v1/worker/events',{method:'POST',token:node.json.data.token,body:{attemptId:execute.attemptId,leaseToken:execute.leaseToken,type:'completed',message:'done',data:{branch:'console/task-1',summary:'Updated app',localReview}}});
+  const detail=await req(f,`/api/v1/tasks/${task.json.data.id}`,{...auth,device});assert.equal(detail.status,200);assert.equal(detail.json.data.localReview.diff,localReview.diff);assert.equal(detail.json.data.result.localReview,undefined);
+  const privateDetail=await req(f,`/api/v1/tasks/${task.json.data.id}`,{...auth,device:otherDevice});assert.equal(privateDetail.status,403);
+  const transfer=await req(f,`/api/v1/tasks/${task.json.data.id}/transfer`,{method:'POST',...auth,device,body:{connectionId:safeConnection.json.data.id}});assert.equal(transfer.status,409);
 });

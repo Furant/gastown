@@ -1,21 +1,18 @@
 import { spawn as nodeSpawn, execFile } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import path from 'node:path';
+import fs from 'node:fs/promises';
 import { buildInvocation, parsePlan } from './tools.mjs';
 import { ensureWorktree, makeCheckpoint, resolveProject } from './workspace.mjs';
 import { exportCheckpoint, importCheckpoint, hasCheckpointState } from './checkpoint.mjs';
 import { randomUUID, createHash } from 'node:crypto';
 import { identifyProcess, writeJournal, recoverJournals, readJournal } from './journal.mjs';
+import { collectLocalReview } from './local-review.mjs';
+import { sanitizeOutput } from './output.mjs';
 
 const OUTPUT_LIMIT=256*1024, LINE_LIMIT=32*1024, LOG_LIMIT=3500;
 const execFileAsync=promisify(execFile);
-const REDACTIONS=[[/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi,'Bearer [redacted]'],[/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,})\b/g,'[redacted credential]'],[/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password)\s*[:=]\s*)[^\s"']+/gi,'$1[redacted]']];
-
-export function sanitizeOutput(input) {
-  let value=String(input??'').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,'');
-  for(const [pattern,replacement] of REDACTIONS)value=value.replace(pattern,replacement);
-  return value.slice(0,OUTPUT_LIMIT);
-}
 function finalTextOf(record) {
   if(typeof record?.result==='string')return record.result;
   if(record?.type==='item.completed'&&['agent_message','assistant_message'].includes(record.item?.type)&&typeof record.item.text==='string')return record.item.text;
@@ -106,6 +103,7 @@ export class AgentRunner {
       if(this.taskAttempts.has(job.taskId))throw new Error('Another attempt already writes to this task on this node');
       this.taskAttempts.set(job.taskId,job.attemptId);
       const project=await this.resolveProject(this.config,job.projectId);this.assertCanLaunch();this.assertNotCancelled(state);
+      await this.validateLocalProject(job,project);
       const invocation=buildInvocation({...job,prompt:makePrompt(job)},{...this.config,capabilities:this.capabilities});
       const remoteCheckpoint=job.checkpoint?.checkpointId?job.checkpoint:undefined;
       const worktree=await this.ensureWorktree(project,job.taskId,remoteCheckpoint?{mustBeNew:true,allowExistingCheckpoint:true}:undefined);this.assertCanLaunch();this.assertNotCancelled(state);
@@ -169,11 +167,12 @@ export class AgentRunner {
       session.terminalState='completing';
       const prUrl=job.allowPR?await this.verifyPullRequest(worktree):undefined;
       if(session.stopping)throw new Error('Task execution was stopped before completion');
-      try{await this.emit(session,'completed',prUrl?`Pull request created: ${prUrl}`:output.slice(0,8000)||'Task process completed',{branch:checkpoint.branch,summary:output.slice(0,8000),...(prUrl?{prUrl}:{})})}
+      const localReview=job.repoType==='local'?await collectLocalReview({worktreePath:worktree.path,project}):undefined;
+      try{await this.emit(session,'completed',prUrl?`Pull request created: ${prUrl}`:output.slice(0,8000)||'Task process completed',{branch:checkpoint.branch,summary:output.slice(0,8000),...(prUrl?{prUrl}:{}),...(localReview?{localReview}:{})})}
       catch(error){if(error.status===409&&error.code==='stale_attempt'){session.keepForStop=true;session.terminalState='awaiting_stop'}throw error}
       session.terminalState='completed';
       session.journalTerminal=true;
-      return {status:job.allowPR?'awaiting_review':'completed',worktree,checkpoint,summary:output,...(prUrl?{prUrl}:{})};
+      return {status:job.allowPR?'awaiting_review':'completed',worktree,checkpoint,summary:output,...(prUrl?{prUrl}:{}),...(localReview?{localReview}:{})};
     }catch(error){
       const alreadyReported=error.message==='AI tool execution failed'||error.message==='Task execution was stopped before completion'||error.code==='NODE_SHUTTING_DOWN'||session?.keepForStop;
       let safeToReport=true;
@@ -217,6 +216,16 @@ export class AgentRunner {
   }
   assertCanLaunch(){if(this.closing){const error=new Error('Node is shutting down; refusing to launch task');error.code='NODE_SHUTTING_DOWN';throw error}}
   assertNotCancelled(state){if(state.cancelRequested){const error=new Error('Task attempt was cancelled before process launch');error.code='TASK_CANCELLED';throw error}}
+  async validateLocalProject(job,project){
+    if(job.repoType===undefined||job.repoType==='remote')return;
+    if(job.repoType!=='local')throw new Error('Unsupported project repository type');
+    if(typeof job.localPath!=='string'||!path.isAbsolute(job.localPath)||job.localPath.length>2048||!project?.repoPath)throw new Error('Local project path does not match the configured node repository');
+    const localPath=await fs.realpath(job.localPath).catch(()=>null);
+    if(localPath!==project.repoPath)throw new Error('Local project path does not match the configured node repository');
+    if(!job.localNodeId||!this.config.nodeId||job.localNodeId!==this.config.nodeId)throw new Error('Local task is assigned to a different bound local node');
+    if(job.allowPush||job.allowPR)throw new Error('A local project cannot push or create pull requests');
+    if(job.checkpoint?.checkpointId||job.handoffTargetId)throw new Error('A remote checkpoint cannot run on a local project');
+  }
   async cancel(cancellation){
     const state=this.pending.get(cancellation.attemptId);if(!state)return false;
     if(cancellation.leaseToken&&state.job.leaseToken!==cancellation.leaseToken)throw new Error('Stop request lease does not match the active attempt');

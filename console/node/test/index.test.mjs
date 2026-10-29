@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { startNode, parseArgs, checkNode } from '../index.mjs';
+import { startNode, parseArgs, checkNode, pairNode } from '../index.mjs';
 import { acquireNodeLock, writeJournal } from '../journal.mjs';
 
 test('node sends zero capacity while a leased task occupies its only slot',async()=>{
@@ -39,6 +39,14 @@ test('transient worker failures retry with a bound and then stop polling',async(
 });
 
 test('node CLI help is available without a config file',()=>assert.deepEqual(parseArgs(['--help']),{help:true}));
+test('node CLI pairing is a one-shot command and rejects polling flags',()=>{
+  assert.deepEqual(parseArgs(['--config','/tmp/node.json','--pair']),{configPath:'/tmp/node.json',once:false,check:false,pair:true});
+  assert.throws(()=>parseArgs(['--config','/tmp/node.json','--pair','--once']),/cannot be combined/i);
+});
+test('pair confirmation sends the supplied code and never prints it',async()=>{
+  const calls=[],logs=[],result=await pairNode({pair:async code=>{calls.push(code);return {paired:true}}},{code:'sensitive-pair-code',logger:{log:value=>logs.push(value)}});
+  assert.equal(result.paired,true);assert.deepEqual(calls,['sensitive-pair-code']);assert.equal(logs.some(value=>value.includes('sensitive-pair-code')),false);
+});
 test('node preflight checks local setup and authenticates without polling for work',async t=>{
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'town-preflight-')),repo=path.join(dir,'repo'),home=path.join(dir,'worktrees');await fs.mkdir(repo);await fs.mkdir(home);
   const git=(...args)=>execFileSync('git',args,{cwd:repo,stdio:'ignore'});git('init','-q');const base=execFileSync('git',['symbolic-ref','--short','HEAD'],{cwd:repo,encoding:'utf8'}).trim();git('config','user.email','fixture@example.test');git('config','user.name','Fixture');await fs.writeFile(path.join(repo,'README.md'),'base');git('add','.');git('commit','-qm','init');t.after(()=>fs.rm(dir,{recursive:true,force:true}));
