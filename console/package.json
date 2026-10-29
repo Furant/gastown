@@ -1,0 +1,21 @@
+{
+  "name": "@furant/gastown-team-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server/index.mjs",
+    "dev": "CONSOLE_EMBEDDED=1 node --env-file-if-exists=.env server/index.mjs",
+    "node": "node node/index.mjs",
+    "check": "node scripts/check.mjs",
+    "test": "node --test --test-timeout=20000 --test-concurrency=1",
+    "test:coverage": "node --test --test-timeout=20000 --test-concurrency=1 --experimental-test-coverage"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.12",
+    "pg": "^8.23.1"
+  }
+}
