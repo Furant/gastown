@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { checkpointTargetReady, cursorFileUrl, formatRecordedCost, localProjectConnections, taskLifecycleActions, taskLifecycleActionsFor, validateBudget, validateChildren } from './workflows.mjs';
+import { canAcceptReview, canReworkReview, checkpointTargetReady, cursorFileUrl, formatRecordedCost, localProjectConnections, nodeConfigSyncCommand, taskLifecycleActions, taskLifecycleActionsFor, validateBudget, validateChildren, validateReviewFeedback } from './workflows.mjs';
 
 test('lifecycle controls follow task state and hide actions while stopping', () => {
   assert.deepEqual(taskLifecycleActions('running'), ['pause', 'cancel']);
@@ -68,4 +68,21 @@ test('Cursor review links accept absolute paths and reject URL injection', () =>
   assert.equal(cursorFileUrl('/Users/alice/Project/src/app.js'), 'cursor://file//Users/alice/Project/src/app.js');
   assert.equal(cursorFileUrl('javascript:alert(1)'), '');
   assert.equal(cursorFileUrl('/tmp/bad\u0000path'), '');
+});
+
+test('review controls require awaiting review, completed children, and leaf tasks for rework', () => {
+  assert.equal(canAcceptReview({ status: 'completed' }), false);
+  assert.equal(canAcceptReview({ status: 'awaiting_review' }), true);
+  assert.equal(canAcceptReview({ status: 'awaiting_review', children: [{ status: 'running' }] }), false);
+  assert.equal(canAcceptReview({ status: 'awaiting_review', children: [{ status: 'completed' }] }), true);
+  assert.equal(canReworkReview({ status: 'awaiting_review' }), true);
+  assert.equal(canReworkReview({ status: 'awaiting_review', hasDependents: true }), false);
+  assert.equal(canReworkReview({ status: 'awaiting_review', children: [{ status: 'completed' }] }), false);
+});
+
+test('review feedback is bounded and the node sync command is copyable', () => {
+  assert.match(validateReviewFeedback('  '), /填写/);
+  assert.match(validateReviewFeedback('x'.repeat(4001)), /4000/);
+  assert.equal(validateReviewFeedback('请补充测试'), '');
+  assert.equal(nodeConfigSyncCommand(), 'npm run node -- --config "$PWD/node-config.json" --sync-config');
 });

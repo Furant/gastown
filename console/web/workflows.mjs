@@ -74,3 +74,23 @@ export function cursorFileUrl(path) {
   if (!absolute) return '';
   return `cursor://file/${encodeURI(path).replace(/#/g, '%23').replace(/\?/g, '%3F')}`;
 }
+
+export function canAcceptReview(task) {
+  if (task?.status !== 'awaiting_review') return false;
+  const children = Array.isArray(task.children) ? task.children : [];
+  return children.length === 0 || children.every(child => child.status === 'completed');
+}
+
+export function canReworkReview(task) {
+  return canAcceptReview(task) && !(Array.isArray(task.children) && task.children.length) && task.hasDependents !== true;
+}
+
+export function validateReviewFeedback(value) {
+  if (typeof value !== 'string' || !value.trim()) return '请填写退回修改的原因。';
+  if (value.trim().length > 4000) return '退回意见不能超过 4000 个字符。';
+  return '';
+}
+
+export function nodeConfigSyncCommand() {
+  return 'npm run node -- --config "$PWD/node-config.json" --sync-config';
+}

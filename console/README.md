@@ -75,7 +75,7 @@ One node uses one local OS identity and its tool logins. Only its owner creates 
 
 Private projects can use a local Git directory instead of a GitHub URL. Here, local means your own development computer, even when the console is hosted on a team server. Register a node first, choose its pairing action in the browser, and run the displayed `--pair` command on that computer using its protected node configuration. Pairing codes expire after five minutes and can be used once. This explicitly associates the node with this browser's device secret; it is an operator-selected machine binding, not hardware attestation. Keep node credentials on that machine. Copying a node's credentials to another machine defeats that binding.
 
-Create the local project with its absolute Git root, base branch and paired node. Download or update the node configuration to map the new project ID to that same directory, then restart the worker. Directory existence, Git root and base branch are checked on the node before launching a tool. The console never opens that path on its server. The directory must already be a Git repository; the worker does not initialize or reset it.
+Create the local project with its absolute Git root, base branch and paired node. Run the configuration synchronization command below to add the new project mapping automatically, then restart the worker. Directory existence, Git root and base branch are checked on the node before launching a tool. The console never opens that path on its server. The directory must already be a Git repository; the worker does not initialize or reset it.
 
 Local projects stay private and execute only on the bound owner node. Tool switching can use another authorized connection on that same node. Other nodes cannot receive those tasks or encrypted checkpoints, and an offline local node leaves work waiting. Local project tasks cannot authorize automatic commits, pushes or PRs.
 
@@ -122,6 +122,28 @@ Project owners and administrators can set daily run, input/output token and reco
 ## Node restart recovery
 
 Workers persist private attempt journals in `.gastown-node-journals/` beside the local configuration, outside task worktrees. Treat these files as credentials because they contain attempt leases; keep the directory private and out of Git. A process lock prevents two workers from starting against the same configuration. On restart, the worker checks the recorded supervisor's PID, start time, process group and unique marker before stopping owned work. Confirmed stopped work becomes paused and requires explicit resume. An uncertain process identity or incomplete transfer remains `recovery_required`; investigate on the node before continuing. Recovery never automatically launches another writer.
+
+## Accept results or request changes
+
+After an execution returns `awaiting_review`, inspect the result in your IDE and choose acceptance or request changes in the task detail. Acceptance records your decision and marks the task completed; it does not merge branches, commit files or push code. Requesting changes requires written feedback, queues a new execution with the existing approved plan and tool permissions, and retains the task worktree, including edits you made during review. The next tool invocation receives that feedback and returns a refreshed review report. Feedback never grants new push/PR permissions. Review decisions remain in task history.
+
+For a decomposed workflow, review its children first; the parent can be accepted only after every child is accepted. Parent-level rework is not automatic. Reworking a child that already has dependent tasks is rejected instead of silently rerunning or invalidating downstream work; coordinate those changes explicitly. Independent or leaf children can be returned for corrections and make the parent await review again.
+
+## Synchronize an existing node configuration
+
+After adding a local project, run this on the paired computer from `console/`:
+
+```sh
+npm run node -- --config "$PWD/node-config.json" --sync-config
+```
+
+The command fetches this node's authorized projects, validates local Git roots and branches, and adds local-project mappings automatically. For a new remote project, specify its local clone explicitly:
+
+```sh
+npm run node -- --config "$PWD/node-config.json" --sync-config --map '<project-id>=/absolute/path/to/clone'
+```
+
+Repeat `--map` for more projects. Existing tool paths, credentials, custom settings and unrelated mappings are preserved. Missing remote paths are reported, not guessed. A local-project mapping cannot be redirected to a different directory. Failed validation leaves the original JSON unchanged. Successful updates create a mode-0600 original copy inside adjacent `.gastown-node-config-backups/` and atomically replace the configuration; keep backups private and outside version control. Concurrent synchronization is refused, and a detected manual edit aborts the update. If a terminated command leaves a `.sync.lock` file, confirm no synchronization process is running before removing that stale lock. The command does not discover models, poll for tasks or invoke AI tools. Restart an already-running worker to load the new configuration. Initial node registration and tool login are still required.
 
 ## Verification
 

@@ -7,3 +7,4 @@ coverage/
 node-config.json
 checkpoint-keys.json
 .gastown-node-journals/
+.gastown-node-config-backups/

@@ -513,3 +513,38 @@ test('local Git projects require a paired private node and browser device, and s
   const privateDetail=await req(f,`/api/v1/tasks/${task.json.data.id}`,{...auth,device:otherDevice});assert.equal(privateDetail.status,403);
   const transfer=await req(f,`/api/v1/tasks/${task.json.data.id}/transfer`,{method:'POST',...auth,device,body:{connectionId:safeConnection.json.data.id}});assert.equal(transfer.status,409);
 });
+
+test('task review acceptance and rework preserve the approved execution scope and feed feedback to the next claim',async t=>{
+ const x=await approvedRunning(t),taskUrl=`/api/v1/tasks/${x.task}`;
+ await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:x.attempt.attemptId,leaseToken:x.attempt.leaseToken,type:'completed',message:'done',data:{branch:'feature/reviewed',prUrl:'https://github.com/team/repo/pull/1',summary:'Initial result'}}});
+ const missingFeedback=await req(x.f,taskUrl+'/review',{method:'POST',...x.auth,body:{decision:'rework'}});assert.equal(missingFeedback.status,400);
+ const rework=await req(x.f,taskUrl+'/review',{method:'POST',...x.auth,body:{decision:'rework',expectedGeneration:0,feedback:'Keep the existing interface and add the missing null check.'}});assert.equal(rework.status,200,JSON.stringify(rework.json));assert.equal(rework.json.data.status,'queued');assert.equal(rework.json.data.reviewRevision,1);assert.equal(rework.json.data.allowPush,true);assert.equal(rework.json.data.allowPr,true);
+ assert.equal((await req(x.f,taskUrl+'/review',{method:'POST',...x.auth,body:{decision:'accept',expectedGeneration:0}})).json.error.code,'review_changed');
+ const job=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:1}})).json.data.jobs[0];assert.equal(job.reviewFeedback,'Keep the existing interface and add the missing null check.');assert.equal(job.kind,'execute');
+ const detail=(await req(x.f,taskUrl,{...x.auth})).json.data;assert.equal(detail.plan.summary,'Do the work');assert.equal(detail.reviewFeedback,job.reviewFeedback);assert.equal(detail.events.find(e=>e.type==='task_reviewed').data.feedback,job.reviewFeedback);assert.equal(JSON.stringify(detail.events).includes('worktreePath'),false);
+ await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:job.attemptId,leaseToken:job.leaseToken,type:'completed',message:'done',data:{branch:'feature/reviewed',prUrl:'https://github.com/team/repo/pull/2',summary:'Corrected'}}});
+ const accepted=await req(x.f,taskUrl+'/review',{method:'POST',...x.auth,body:{decision:'accept',expectedGeneration:1}});assert.equal(accepted.status,200);assert.equal(accepted.json.data.status,'completed');assert.equal(accepted.json.data.reviewRevision,2);
+});
+
+test('worker config manifest includes only current granted projects and never credentials',async t=>{
+ const x=await ownerFixture(t),connection=(await x.f.db.query('SELECT node_id FROM connections WHERE id=$1',[x.source])).rows[0];
+ const manifest=await req(x.f,'/api/v1/worker/config',{method:'POST',token:x.token,body:{}});assert.equal(manifest.status,200,JSON.stringify(manifest.json));assert.equal(manifest.json.data.nodeId,connection.node_id);assert.deepEqual(manifest.json.data.projects.map(p=>p.id),[x.project]);
+ const encoded=JSON.stringify(manifest.json);assert.equal(encoded.includes(x.token),false);assert.equal(encoded.includes('tokenHash'),false);assert.equal(encoded.includes('repoUrl'),false);
+ await x.f.db.query('UPDATE nodes SET project_ids=\'[]\'::jsonb WHERE id=$1',[connection.node_id]);const empty=await req(x.f,'/api/v1/worker/config',{method:'POST',token:x.token,body:{}});assert.deepEqual(empty.json.data.projects,[]);
+});
+
+test('workflow review requires child acceptance, blocks stale downstream rework, and reopens after leaf rework',async t=>{
+ const x=await ownerFixture(t),make=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Workflow review',description:'Review each child',projectId:x.project,connectionId:x.source}}),parentId=make.json.data.id;
+ const plan=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.jobs[0];await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:plan.attemptId,leaseToken:plan.leaseToken,type:'plan_ready',data:{summary:'Split',steps:[{title:'A',acceptance:'A'},{title:'B',acceptance:'B'}]}}});
+ await req(x.f,`/api/v1/tasks/${parentId}/decompose`,{method:'POST',...x.auth,body:{children:[{key:'a',title:'A',description:'Do A',connectionId:x.source,dependsOn:[]},{key:'b',title:'B',description:'Do B',connectionId:x.target,dependsOn:['a']}]}});await req(x.f,`/api/v1/tasks/${parentId}/approve`,{method:'POST',...x.auth,body:{allowPush:false,allowPR:false}});
+ let jobs=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:2}})).json.data.jobs;const a=jobs[0];await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:a.attemptId,leaseToken:a.leaseToken,type:'completed',data:{branch:'a'}}});
+ const b=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:2}})).json.data.jobs[0];await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:b.attemptId,leaseToken:b.leaseToken,type:'completed',data:{branch:'b'}}});
+ const detail=(await req(x.f,`/api/v1/tasks/${parentId}`,{cookie:x.auth.cookie})).json.data,childA=detail.children.find(c=>c.key==='a'),childB=detail.children.find(c=>c.key==='b');
+ assert.equal((await req(x.f,`/api/v1/tasks/${parentId}/review`,{method:'POST',...x.auth,body:{decision:'rework',expectedGeneration:0,feedback:'Redo'}})).status,409);assert.equal((await req(x.f,`/api/v1/tasks/${parentId}/review`,{method:'POST',...x.auth,body:{decision:'accept',expectedGeneration:0}})).status,409);
+ assert.equal((await req(x.f,`/api/v1/tasks/${childA.id}/review`,{method:'POST',...x.auth,body:{decision:'rework',expectedGeneration:0,feedback:'Redo'}})).status,409);
+ await req(x.f,`/api/v1/tasks/${childA.id}/review`,{method:'POST',...x.auth,body:{decision:'accept',expectedGeneration:0}});
+ const rework=await req(x.f,`/api/v1/tasks/${childB.id}/review`,{method:'POST',...x.auth,body:{decision:'rework',expectedGeneration:0,feedback:'Fix the leaf result'}});assert.equal(rework.status,200);assert.equal((await req(x.f,`/api/v1/tasks/${parentId}`,{cookie:x.auth.cookie})).json.data.status,'orchestrating');
+ const rerun=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:2}})).json.data.jobs[0];assert.equal(rerun.taskId,childB.id);await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:rerun.attemptId,leaseToken:rerun.leaseToken,type:'completed',data:{branch:'b-fixed'}}});
+ await req(x.f,`/api/v1/tasks/${childB.id}/review`,{method:'POST',...x.auth,body:{decision:'accept',expectedGeneration:1}});
+ const parentAccepted=await req(x.f,`/api/v1/tasks/${parentId}/review`,{method:'POST',...x.auth,body:{decision:'accept',expectedGeneration:0}});assert.equal(parentAccepted.json.data?.status,'completed',JSON.stringify(parentAccepted.json));
+});

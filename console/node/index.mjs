@@ -8,8 +8,9 @@ import { constants as fsConstants } from 'node:fs';
 import { resolveProject } from './workspace.mjs';
 import { ensureNodeCheckpointKeys } from './checkpoint.mjs';
 import { recoverJournals, acquireNodeLock } from './journal.mjs';
+import { parseMappings, syncNodeConfig } from './config-sync.mjs';
 
-export function parseArgs(args){let configPath,once=false,check=false,pair=false;for(let i=0;i<args.length;i++){if(args[i]==='--help'||args[i]==='-h')return{help:true};if(args[i]==='--config')configPath=args[++i];else if(args[i]==='--once')once=true;else if(args[i]==='--check')check=true;else if(args[i]==='--pair')pair=true;else throw new Error(`Unknown argument: ${args[i]}`)}if(!configPath)throw new Error('Usage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check|--pair]');if(once&&check||pair&&(once||check))throw new Error('--pair, --once and --check cannot be combined');return{configPath,once,check,...(pair?{pair:true}:{})}}
+export function parseArgs(args){let configPath,once=false,check=false,pair=false,syncConfig=false;const maps=[];for(let i=0;i<args.length;i++){if(args[i]==='--help'||args[i]==='-h')return{help:true};if(args[i]==='--config')configPath=args[++i];else if(args[i]==='--once')once=true;else if(args[i]==='--check')check=true;else if(args[i]==='--pair')pair=true;else if(args[i]==='--sync-config')syncConfig=true;else if(args[i]==='--map')maps.push(args[++i]||'');else throw new Error(`Unknown argument: ${args[i]}`)}if(!configPath)throw new Error('Usage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check|--pair|--sync-config]');if(Number(once)+Number(check)+Number(pair)+Number(syncConfig)>1)throw new Error('--sync-config, --pair, --once and --check cannot be combined');if(maps.length&&!syncConfig)throw new Error('--map requires --sync-config');return{configPath,once,check,...(pair?{pair:true}:{}),...(syncConfig?{syncConfig:true,maps:parseMappings(maps)}:{})}}
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
 function capabilityViews(capabilities){
@@ -22,6 +23,12 @@ export async function pairNode(client,{code,logger=console}={}){
   const result=await client.pair(code.trim());
   if(!result?.paired)throw new Error('The node was not paired; check that the code is current and matches this node');
   logger.log('Local node paired successfully. Return to the console to create a private local project.');
+  return result;
+}
+export async function syncNode(config,{client=new WorkerClient(config),maps={},logger=console}={}){
+  const result=await syncNodeConfig(config,await client.config(),{maps});
+  logger.log(`Node configuration ${result.changed?'updated':'already current'}; mapped projects: ${result.mapped.join(', ')||'none'}.`);
+  if(result.missing.length)logger.log(`Remote projects need an explicit --map: ${result.missing.join(', ')}.`);
   return result;
 }
 export async function checkNode(config,{client=new WorkerClient(config),capabilities,logger=console}={}){
@@ -79,5 +86,5 @@ export async function startNode(config,{once=false,client:providedClient,capabil
 }
 
 if(import.meta.url===new URL(`file://${process.argv[1]}`).href){
-  try{const args=parseArgs(process.argv.slice(2));if(args.help)console.log('Gas Town team console execution node\n\nUsage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check|--pair]\n\nOptions:\n  --config PATH  Load this node\'s private JSON config (mode 0600)\n  --check        Validate paths and tools, discover models, and authenticate without claiming tasks\n  --once         Poll once, execute returned jobs, then exit\n  --pair         Pair this machine by entering a short-lived code from the authenticated console\n  -h, --help     Show this help\n\nSet GAS_TOWN_NODE_TOKEN in the environment instead of storing a token in a 0600 config.');else{const config=await loadConfig(args.configPath);if(args.check)await checkNode(config);else if(args.pair){const {createInterface}=await import('node:readline/promises');const readline=createInterface({input:process.stdin,output:process.stdout});try{const code=await readline.question('Pairing code (will be visible as typed): ');await pairNode(new WorkerClient(config),{code})}finally{readline.close()}}else await startNode(config,args)}}catch(error){console.error(error.message);process.exitCode=1}
+  try{const args=parseArgs(process.argv.slice(2));if(args.help)console.log('Gas Town team console execution node\n\nUsage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check|--pair|--sync-config]\n\nOptions:\n  --config PATH  Load this node\'s private JSON config (mode 0600)\n  --check        Validate paths and tools, discover models, and authenticate without claiming tasks\n  --once         Poll once, execute returned jobs, then exit\n  --pair         Pair this machine by entering a short-lived code from the authenticated console\n  --sync-config  Fetch granted projects and safely merge validated mappings\n  --map ID=PATH  Map a remote project to an absolute local Git repository (repeatable)\n  -h, --help     Show this help\n\nSet GAS_TOWN_NODE_TOKEN in the environment instead of storing a token in a 0600 config.');else{const config=await loadConfig(args.configPath);if(args.syncConfig)await syncNode(config,{maps:args.maps});else if(args.check)await checkNode(config);else if(args.pair){const {createInterface}=await import('node:readline/promises');const readline=createInterface({input:process.stdin,output:process.stdout});try{const code=await readline.question('Pairing code (will be visible as typed): ');await pairNode(new WorkerClient(config),{code})}finally{readline.close()}}else await startNode(config,args)}}catch(error){console.error(error.message);process.exitCode=1}
 }

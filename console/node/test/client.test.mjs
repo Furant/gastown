@@ -9,6 +9,11 @@ test('worker requests use bearer auth and unwrap the API envelope',async()=>{
   const result=await client.poll();assert.deepEqual(result,{jobs:[],cancellations:[{attemptId:'a'}]});assert.equal(seen.url,'http://localhost:8768/api/v1/worker/poll');assert.equal(seen.init.headers.authorization,'Bearer node-secret');
 });
 
+test('worker config fetch is a one-shot authenticated empty POST',async()=>{
+  let seen;const client=new WorkerClient({serverUrl:'http://localhost:8768',token:'node-secret',fetchImpl:async(url,init)=>{seen={url,init};return{ok:true,json:async()=>({data:{nodeId:'node-1',projects:[]}})}}});
+  assert.deepEqual(await client.config(),{nodeId:'node-1',projects:[]});assert.equal(seen.url,'http://localhost:8768/api/v1/worker/config');assert.equal(seen.init.method,'POST');assert.equal(seen.init.body,'{}');
+});
+
 test('worker API errors are surfaced without exposing request credentials',async()=>{
   const client=new WorkerClient({serverUrl:'http://localhost',token:'secret',fetchImpl:async()=>({ok:false,status:401,json:async()=>({error:{message:'Unauthorized'}})})});
   await assert.rejects(client.heartbeat({tools:[]}),/authorization failed \(401\)/);
