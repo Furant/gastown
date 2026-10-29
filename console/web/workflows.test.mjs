@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { checkpointTargetReady, taskLifecycleActions, validateChildren } from './workflows.mjs';
+import { checkpointTargetReady, formatRecordedCost, taskLifecycleActions, taskLifecycleActionsFor, validateBudget, validateChildren } from './workflows.mjs';
 
 test('lifecycle controls follow task state and hide actions while stopping', () => {
   assert.deepEqual(taskLifecycleActions('running'), ['pause', 'cancel']);
@@ -31,4 +31,23 @@ test('cross-node transfer requires an online node with a fresh reported checkpoi
   assert.match(checkpointTargetReady({ status: 'online', checkpointPublicKeyPresent: true, onlineAt: new Date(now - 46_000).toISOString() }, now).reason, /过期/);
   assert.equal(checkpointTargetReady({ status: 'online', checkpointPublicKeyPresent: true, onlineAt: new Date(now - 45_000).toISOString() }, now).ready, true);
   assert.equal(checkpointTargetReady({ status: 'online', checkpointPublicKeyPresent: true, onlineAt: new Date(now).toISOString() }, now).ready, true);
+});
+
+test('recovery_required never offers lifecycle retry or resume', () => {
+  assert.deepEqual(taskLifecycleActionsFor({ status: 'recovery_required' }), []);
+  assert.equal(taskLifecycleActionsFor({ status: 'failed' }).includes('retry'), true);
+});
+
+test('usage leaves missing recorded cost unknown', () => {
+  assert.equal(formatRecordedCost(null), '未报告');
+  assert.equal(formatRecordedCost(undefined), '未报告');
+  assert.equal(formatRecordedCost(1_250_000), '1.25 USD');
+});
+
+test('budget limits are optional positive integers and enabled budgets need a limit', () => {
+  assert.equal(validateBudget({ enabled: true, maxRunsPerDay: '5' }), '');
+  assert.equal(validateBudget({ enabled: false, maxRunsPerDay: '' }), '');
+  assert.match(validateBudget({ enabled: true, maxRunsPerDay: '' }), /至少填写一项/);
+  assert.match(validateBudget({ enabled: true, maxInputTokens: '0' }), /大于 0 的整数/);
+  assert.match(validateBudget({ enabled: true, maxOutputTokens: '1.5' }), /大于 0 的整数/);
 });

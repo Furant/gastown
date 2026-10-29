@@ -19,6 +19,7 @@ export class WorkerClient{
   heartbeat(capabilities,checkpointPublicKey){return this.request('heartbeat',{capabilities,...(checkpointPublicKey?{checkpointPublicKey}:{})})}
   poll({capacity=1}={}){return this.request('poll',{capacity})}
   event(body){return this.request('events',body)}
+  recover(body){return this.request('recover',body)}
   uploadCheckpoint(body){return this.request('checkpoints',body,60000)}
   readCheckpoint(id,body){if(!/^[A-Za-z0-9_-]{1,120}$/.test(id))throw new Error('Invalid checkpoint id');return this.request(`checkpoints/${encodeURIComponent(id)}/read`,body,60000)}
 }

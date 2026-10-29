@@ -7,6 +7,7 @@ import fs from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { resolveProject } from './workspace.mjs';
 import { ensureNodeCheckpointKeys } from './checkpoint.mjs';
+import { recoverJournals, acquireNodeLock } from './journal.mjs';
 
 export function parseArgs(args){let configPath,once=false,check=false;for(let i=0;i<args.length;i++){if(args[i]==='--help'||args[i]==='-h')return{help:true};if(args[i]==='--config')configPath=args[++i];else if(args[i]==='--once')once=true;else if(args[i]==='--check')check=true;else throw new Error(`Unknown argument: ${args[i]}`)}if(!configPath)throw new Error('Usage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check]');if(once&&check)throw new Error('--once and --check cannot be combined');return{configPath,once,check}}
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -27,11 +28,10 @@ export async function checkNode(config,{client=new WorkerClient(config),capabili
   logger.log(`Server authentication: OK (${config.serverUrl})`);for(const project of projects)logger.log(`Project ${project.id}: OK (${project.path}, ${project.baseBranch})`);for(const [tool] of configured)logger.log(`${tool}: OK (${views.runner.tools[tool].models.length} supported models)`);
   return {serverUrl:config.serverUrl,projects,tools:views.runner.tools};
 }
-export async function startNode(config,{once=false,client:providedClient,capabilities:providedCapabilities,logger=console,signalSource=process,runnerFactory=options=>new AgentRunner(options)}={}){
+export async function startNode(config,{once=false,client:providedClient,capabilities:providedCapabilities,logger=console,signalSource=process,runnerFactory=options=>new AgentRunner(options),discoverCapabilitiesImpl=discoverCapabilities}={}){
   const client=providedClient||new WorkerClient(config);
-  const checkpointKeys=await ensureNodeCheckpointKeys(config);
-  const views=capabilityViews(providedCapabilities||await discoverCapabilities(config));
-  const runner=runnerFactory({config,capabilities:views.runner,client,checkpointKeys,logger});
+  const releaseNodeLock=config.configPath?await acquireNodeLock(config):async()=>{};
+  let checkpointKeys,views,runner;
   const active=new Map();let stopping=false;
   const onSignal=()=>{stopping=true};signalSource.once('SIGINT',onSignal);signalSource.once('SIGTERM',onSignal);
   const runJob=job=>{const promise=runner.run(job).catch(error=>logger.error('task attempt failed',error.message)).finally(()=>active.delete(job.attemptId));active.set(job.attemptId,promise);return promise};
@@ -43,9 +43,13 @@ export async function startNode(config,{once=false,client:providedClient,capabil
     await wait(Math.min(30000,config.pollIntervalMs*2**Math.min(consecutiveFailures-1,5)));
   };
   try{
+    if(client.recover)await recoverJournals(config,client,logger);
+    checkpointKeys=await ensureNodeCheckpointKeys(config);
+    views=capabilityViews(providedCapabilities||await discoverCapabilitiesImpl(config));
+    runner=runnerFactory({config,capabilities:views.runner,client,checkpointKeys,logger});
     let nextHeartbeat=0,nextCapabilityRefresh=Date.now()+300000;
     do{
-      if(Date.now()>=nextCapabilityRefresh){try{const updated=capabilityViews(await discoverCapabilities(config));views.reported=updated.reported;views.runner=updated.runner;runner.capabilities=updated.runner}catch(error){logger.error('capability refresh failed',error.message)}nextCapabilityRefresh=Date.now()+300000}
+      if(Date.now()>=nextCapabilityRefresh){try{const updated=capabilityViews(await discoverCapabilitiesImpl(config));views.reported=updated.reported;views.runner=updated.runner;runner.capabilities=updated.runner}catch(error){logger.error('capability refresh failed',error.message)}nextCapabilityRefresh=Date.now()+300000}
       if(Date.now()>=nextHeartbeat){nextHeartbeat=Date.now()+15000;try{await client.heartbeat(views.reported,checkpointKeys.publicKey);consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}}
       const capacity=once?config.maxConcurrent:Math.max(0,config.maxConcurrent-Math.max(active.size,runner.running.size));
       let result;try{result=await client.poll({capacity});consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}
@@ -60,9 +64,9 @@ export async function startNode(config,{once=false,client:providedClient,capabil
       await wait(config.pollIntervalMs);
     }while(!stopping);
   }finally{
-    if(typeof runner.shutdown==='function')await runner.shutdown();
-    else for(const attemptId of runner.running.keys())await runner.stop(attemptId).catch(error=>logger.error('shutdown stop failed',error.message));
-    await Promise.allSettled(active.values());signalSource.removeListener('SIGINT',onSignal);signalSource.removeListener('SIGTERM',onSignal);
+    if(runner&&typeof runner.shutdown==='function')await runner.shutdown();
+    else if(runner)for(const attemptId of runner.running.keys())await runner.stop(attemptId).catch(error=>logger.error('shutdown stop failed',error.message));
+    await Promise.allSettled(active.values());signalSource.removeListener('SIGINT',onSignal);signalSource.removeListener('SIGTERM',onSignal);await releaseNodeLock();
   }
   return {capabilities:views.reported};
 }

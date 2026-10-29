@@ -4,6 +4,8 @@ import { promisify } from 'node:util';
 import { buildInvocation, parsePlan } from './tools.mjs';
 import { ensureWorktree, makeCheckpoint, resolveProject } from './workspace.mjs';
 import { exportCheckpoint, importCheckpoint, hasCheckpointState } from './checkpoint.mjs';
+import { randomUUID, createHash } from 'node:crypto';
+import { identifyProcess, writeJournal, recoverJournals, readJournal } from './journal.mjs';
 
 const OUTPUT_LIMIT=256*1024, LINE_LIMIT=32*1024, LOG_LIMIT=3500;
 const execFileAsync=promisify(execFile);
@@ -18,6 +20,22 @@ function finalTextOf(record) {
   if(typeof record?.result==='string')return record.result;
   if(record?.type==='item.completed'&&['agent_message','assistant_message'].includes(record.item?.type)&&typeof record.item.text==='string')return record.item.text;
   return '';
+}
+const PROVIDER_ENV_ALLOW=new Set(['OPENAI_API_KEY','OPENAI_ORG_ID','OPENAI_PROJECT_ID','ANTHROPIC_API_KEY','CURSOR_API_KEY','CODEX_HOME','CURSOR_HOME']);
+function providerEnvironment(source){
+  const safe=new Set(['PATH','HOME','USER','LOGNAME','TMPDIR','TEMP','TMP','LANG','LC_ALL','LC_CTYPE','TERM','CI','NO_COLOR','FORCE_COLOR','GIT_TERMINAL_PROMPT']);
+  return Object.fromEntries(Object.entries(source).filter(([key])=>safe.has(key)||PROVIDER_ENV_ALLOW.has(key)||/^LC_[A-Z0-9_]+$/.test(key)));
+}
+function usageOf(record,attemptId,sequence){
+  const value=record?.type==='turn.completed'?record.usage:record?.type==='result'?(record.usage||record.result?.usage):null;if(!value||typeof value!=='object')return null;
+  const inputTokens=value.input_tokens??value.inputTokens??value.total_input_tokens,outputTokens=value.output_tokens??value.outputTokens??value.total_output_tokens;
+  const cachedInputTokens=value.cached_input_tokens??value.cachedInputTokens??value.input_token_details?.cached_tokens;
+  const validNumber=n=>Number.isSafeInteger(n)&&n>=0&&n<=1_000_000_000;
+  if(!validNumber(inputTokens)||!validNumber(outputTokens)||cachedInputTokens!==undefined&&(!validNumber(cachedInputTokens)||cachedInputTokens>inputTokens))return null;
+  const usd=value.total_cost_usd??value.cost_usd;const costMicros=typeof usd==='number'&&Number.isFinite(usd)&&usd>=0&&usd<=1_000_000?Math.round(usd*1_000_000):undefined;
+  const data={inputTokens,outputTokens,...(cachedInputTokens===undefined?{}:{cachedInputTokens}),...(costMicros===undefined?{}:{costMicros,currency:'USD'})};
+  const id=createHash('sha256').update(attemptId+'\0'+sequence+'\0'+JSON.stringify(data)+'\0'+String(record.turn_id??record.turnId??record.id??'')).digest('hex').slice(0,40);
+  return {eventId:id,usageSequence:sequence,...data};
 }
 const QUOTA_ERROR_CODES=new Set(['usage_limit_reached','insufficient_quota','quota_exceeded']);
 function quotaFailure(text) {
@@ -72,7 +90,7 @@ export class AgentRunner {
     this.processGroupAlive=groupAlive;
     this.verifyPullRequest=verifyPullRequestImpl;
     this.resolveProject=resolveProjectImpl;this.ensureWorktree=ensureWorktreeImpl;this.closing=false;
-    this.stopTimeoutMs=stopTimeoutMs;this.logger=logger;this.checkpointKeys=checkpointKeys;this.running=new Map();this.taskAttempts=new Map();this.inFlight=new Set();this.pending=new Map();
+    this.stopTimeoutMs=stopTimeoutMs;this.logger=logger;this.checkpointKeys=checkpointKeys;this.running=new Map();this.taskAttempts=new Map();this.inFlight=new Set();this.pending=new Map();this.blockedTasks=new Set();this.journaling=spawnImpl===nodeSpawn;
   }
   emit(session,type,message,data){
     if(session.stopping&&type!=='stopped')return Promise.resolve();
@@ -105,14 +123,30 @@ export class AgentRunner {
       }
       this.assertCanLaunch();this.assertNotCancelled(state);
       invocation.cwd=worktree.path;
-      const childEnv=Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith('GIT_')));
-      const child=this.spawnImpl(invocation.command,invocation.args,{cwd:invocation.cwd,env:{...childEnv,GIT_TERMINAL_PROMPT:'0',CI:'1'},shell:false,detached:process.platform!=='win32',windowsHide:true,stdio:['ignore','pipe','pipe']});
-      session={job,project,worktree,child,output:'',pendingLine:'',stopping:false,terminalState:'running',eventPromises:[],state};
+      const childEnv=providerEnvironment(process.env);
+      const journal={attemptId:job.attemptId,taskId:job.taskId,leaseToken:job.leaseToken,phase:'preparing',tool:job.tool,createdAt:new Date().toISOString()};
+      if(this.journaling)await writeJournal(this.config,journal);
+      const marker=randomUUID();
+      const launchEnv={...childEnv,GIT_TERMINAL_PROMPT:'0',CI:'1'};
+      const child=this.journaling&&process.platform!=='win32'
+        ?this.spawnImpl(process.execPath,[new URL('./supervisor.mjs',import.meta.url).pathname,marker],{cwd:invocation.cwd,env:{...launchEnv,GT_NODE_CONFIG_JSON:JSON.stringify({configPath:this.config.configPath,worktreesDir:this.config.worktreesDir,nodeId:this.config.nodeId}),GT_NODE_INVOCATION_JSON:JSON.stringify({...invocation,env:launchEnv}),GT_NODE_RECORD_JSON:JSON.stringify(journal)},shell:false,detached:true,windowsHide:true,stdio:['ignore','pipe','pipe']})
+        :this.spawnImpl(invocation.command,invocation.args,{cwd:invocation.cwd,env:launchEnv,shell:false,detached:process.platform!=='win32',windowsHide:true,stdio:['ignore','pipe','pipe']});
+      state.journal=journal;if(state.cancelRequested){journal.stopIntent={reason:state.cancelRequested.reason};await writeJournal(this.config,journal)}
+      session={job,project,worktree,child,output:'',pendingLine:'',stopping:false,terminalState:'running',eventPromises:[],usageSequence:0,state};
       this.running.set(job.attemptId,session);
       session.closed=new Promise(resolve=>{let ended=false;const finish=x=>{if(!ended){ended=true;resolve(x)}};child.once('error',error=>finish({code:1,error}));child.once('close',(code,signal)=>finish({code,signal}))});
       child.stdout?.on('data',bytes=>this.readOutput(session,bytes));child.stderr?.on('data',bytes=>this.readOutput(session,bytes));
+      if(this.journaling&&process.platform!=='win32'){
+        let identity=await identifyProcess(child.pid);
+        if(identity&&!identity.command.includes(marker))identity=null;
+        if(!identity){const saved=await readJournal(this.config,job.attemptId).catch(()=>null);if(saved?.pid===child.pid&&saved.marker===marker&&saved.identity)identity={...saved.identity,command:marker}}
+        if(!identity)throw new Error('Unable to verify supervisor process identity; attempt blocked for recovery');
+        journal.phase='running';journal.pid=child.pid;journal.marker=marker;journal.identity={startTime:identity.startTime,pgid:identity.pgid};journal.checkpoint={branch:worktree.branch,dirty:true};await writeJournal(this.config,journal);
+      }
       if(state.cancelRequested)await this.stop(job.attemptId,job.leaseToken,state.cancelRequested);
       const outcome=await session.closed;this.readOutput(session,Buffer.alloc(0),true);session.exitOutcome=outcome;
+      await Promise.allSettled(session.eventPromises);
+      if(session.usageDeliveryFailed){session.keepForStop=true;session.terminalState='awaiting_usage';throw new Error('Provider usage delivery is pending recovery; refusing terminal completion')}
       if(session.stopping)throw new Error('Task execution was stopped before completion');
       await this.terminateProcessGroup(child);
       session.processGroupStopped=true;
@@ -121,11 +155,13 @@ export class AgentRunner {
         const isQuota=quotaFailure(session.output);
         const checkpoint=isQuota?await makeCheckpoint(worktree):undefined;
         await this.emit(session,isQuota?'quota_exhausted':'failed',output||outcome.error?.message||('Tool exited with status '+outcome.code),checkpoint?{checkpoint}:undefined);
+        session.journalTerminal=true;
         throw new Error('AI tool execution failed');
       }
       if(job.kind==='plan'){
         const plan=parsePlan(output);
         await this.emit(session,'plan_ready',plan.summary,plan);
+        session.journalTerminal=true;
         return {status:'plan_ready',plan,worktree};
       }
       const checkpoint=await makeCheckpoint(worktree);
@@ -136,6 +172,7 @@ export class AgentRunner {
       try{await this.emit(session,'completed',prUrl?`Pull request created: ${prUrl}`:output.slice(0,8000)||'Task process completed',{branch:checkpoint.branch,summary:output.slice(0,8000),...(prUrl?{prUrl}:{})})}
       catch(error){if(error.status===409&&error.code==='stale_attempt'){session.keepForStop=true;session.terminalState='awaiting_stop'}throw error}
       session.terminalState='completed';
+      session.journalTerminal=true;
       return {status:job.allowPR?'awaiting_review':'completed',worktree,checkpoint,summary:output,...(prUrl?{prUrl}:{})};
     }catch(error){
       const alreadyReported=error.message==='AI tool execution failed'||error.message==='Task execution was stopped before completion'||error.code==='NODE_SHUTTING_DOWN'||session?.keepForStop;
@@ -156,12 +193,14 @@ export class AgentRunner {
         if(session)await this.emit(session,'failed',error.message).catch(()=>{});
         else await this.client.event({attemptId:job?.attemptId,leaseToken:job?.leaseToken,type:'failed',message:sanitizeOutput(error.message)}).catch(()=>{});
       }
+      if(this.journaling&&!session)await writeJournal(this.config,{attemptId:job?.attemptId,taskId:job?.taskId,phase:'terminal',finishedAt:new Date().toISOString()}).catch(()=>{});
       throw error;
     }finally{
       if(session){
         await Promise.allSettled(session.eventPromises);
         if(session.lastEventError)this.logger.error('node event delivery failed',sanitizeOutput(session.lastEventError.message));
         state.runSettled=true;
+        if(this.journaling&&session.processGroupStopped&&session.journalTerminal)await writeJournal(this.config,{attemptId:job.attemptId,taskId:job.taskId,phase:'terminal',finishedAt:new Date().toISOString()}).catch(error=>this.logger.error('node journal finalization failed',sanitizeOutput(error.message)));
         if(session.processGroupStopped&&!session.keepForStop){this.running.delete(session.job.attemptId);if(this.taskAttempts.get(session.job.taskId)===session.job.attemptId)this.taskAttempts.delete(session.job.taskId)}
       } else if(this.taskAttempts.get(job?.taskId)===job?.attemptId)this.taskAttempts.delete(job.taskId);
       if(!session?.keepForStop)this.pending.delete(job.attemptId);state.doneResolve();
@@ -184,11 +223,13 @@ export class AgentRunner {
     if(!['pause','cancel','transfer'].includes(cancellation.reason))throw new Error('Invalid cancellation reason');
     if(state.cancelRequested){if(state.cancelRequested.reason!==cancellation.reason)throw new Error('A different stop intent is already being processed');const current=this.running.get(cancellation.attemptId);if(current)return this.stop(cancellation.attemptId,cancellation.leaseToken,state.cancelRequested);await state.done;return true}
     state.cancelRequested=cancellation;
+    if(this.journaling&&state.journal){state.journal.stopIntent={reason:cancellation.reason};await writeJournal(this.config,state.journal)}
     const session=this.running.get(cancellation.attemptId);
     if(session)return this.stop(cancellation.attemptId,cancellation.leaseToken,cancellation);
     await state.done;return true;
   }
   async shutdown(){this.closing=true;const results=await Promise.allSettled([...this.running.keys()].map(id=>this.stop(id)));for(const result of results)if(result.status==='rejected')this.logger.error('shutdown stop failed',sanitizeOutput(result.reason?.message));return results}
+  async recover(){const blocked=await recoverJournals(this.config,this.client,this.logger);for(const taskId of blocked)this.blockedTasks.add(taskId);return blocked}
   readOutput(session,bytes,flush=false){
     if(session.output.length>=OUTPUT_LIMIT)return;
     session.pendingLine+=bytes.toString('utf8');
@@ -200,9 +241,15 @@ export class AgentRunner {
     if(!line)return;
     const safe=sanitizeOutput(line);session.output=(session.output+safe+'\n').slice(-OUTPUT_LIMIT);
     let parsed;try{parsed=JSON.parse(line)}catch{parsed=null}
+    const usage=parsed&&usageOf(parsed,session.job.attemptId,session.usageSequence+1);if(usage){session.usageSequence++;session.eventPromises.push(this.emitUsage(session,usage))}
     if(parsed?.type==='thinking')return;
     const final=parsed&&(parsed.type==='result'||parsed.type==='item.completed'&&['agent_message','assistant_message'].includes(parsed.item?.type));
     if(!final)session.eventPromises.push(this.emit(session,'log',safe.slice(0,LOG_LIMIT)));
+  }
+  async emitUsage(session,usage){
+    const {usageSequence,...eventData}=usage;
+    if(this.journaling&&session.state.journal){const current=session.state.journal.usageEvents||[];if(!current.some(event=>event.eventId===eventData.eventId)){session.state.journal.usageSequence=usageSequence;session.state.journal.usageEvents=[...current,eventData].slice(-100);await writeJournal(this.config,session.state.journal)}}
+    try{await this.emit(session,'usage','Provider reported tool usage',eventData)}catch(error){session.usageDeliveryFailed=true;throw error}
   }
   finalText(output){
     const results=[];for(const line of output.split('\n').filter(Boolean)){try{const value=finalTextOf(JSON.parse(line));if(value)results.push(value)}catch{}}
@@ -232,6 +279,7 @@ export class AgentRunner {
         const local=await makeCheckpoint(session.worktree);checkpoint={checkpointId:uploaded.checkpointId,digest:uploaded.digest,head:exported.head,branch:local.branch,dirty:local.dirty,transferId:handoff.transferId};
       }else checkpoint=await makeCheckpoint(session.worktree);
       await this.client.event({attemptId,leaseToken:session.job.leaseToken,type:'stopped',message:'Source process stopped; worktree checkpoint recorded',data:{reason:cancellation?.reason||'cancel',...(checkpoint?{checkpoint}:{}),...(cancellation?.handoff?.transferId?{transferId:cancellation.handoff.transferId}:{})}});
+      session.journalTerminal=true;
       session.terminalState='stopped';
       if(session.state.runSettled){this.running.delete(attemptId);this.pending.delete(attemptId);if(this.taskAttempts.get(session.job.taskId)===attemptId)this.taskAttempts.delete(session.job.taskId)}
       return {stopped:true,checkpoint};

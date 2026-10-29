@@ -19,7 +19,7 @@ async function setup(t, output, runnerOptions={}) {
   const events=[];
   const client={event:async body=>{events.push(structuredClone(body));return {ok:true}},heartbeat:async()=>{},poll:async()=>({jobs:[],cancellations:[]})};
   let active;
-  const spawnImpl=()=>{const c=new EventEmitter();c.stdout=new PassThrough();c.stderr=new PassThrough();c.pid=123;c.exitCode=null;c.kill=()=>{c.exitCode=0;setImmediate(()=>c.emit('close',0,null));return true};active=c;setImmediate(()=>{c.emit('spawn');if(output!==null&&output!==undefined){const exitCode=output.fixtureExitCode??0;c.stdout.write(JSON.stringify(output.record??output)+'\n');c.exitCode=exitCode;setImmediate(()=>c.emit('close',exitCode,null))}});return c};
+  const spawnImpl=()=>{const c=new EventEmitter();c.stdout=new PassThrough();c.stderr=new PassThrough();c.pid=123;c.exitCode=null;c.kill=()=>{c.exitCode=0;setImmediate(()=>c.emit('close',0,null));return true};active=c;setImmediate(()=>{c.emit('spawn');if(output!==null&&output!==undefined){const exitCode=output.fixtureExitCode??0;for(const record of output.records||[output.record??output])c.stdout.write(JSON.stringify(record)+'\n');c.exitCode=exitCode;setImmediate(()=>c.emit('close',exitCode,null))}});return c};
   const runner=new AgentRunner({config:{projects:{p:{repoPath:repo,baseBranch:base}},worktreesDir:home,codex:{command:'/fixture/codex'},cursor:{command:'/fixture/agent'},maxConcurrent:2},capabilities:{tools:{codex:{models:[{id:'gpt-6.1-sol',modes:['low','high'],nativeByMode:{low:'gpt-6.1-sol',high:'gpt-6.1-sol'}}]}}},client,spawnImpl,signalProcess:async child=>child.kill('SIGTERM'),processGroupAlive:child=>child.exitCode===null,stopTimeoutMs:30,logger:{error(){}},...runnerOptions});
   return {runner,events,repo,child:()=>active};
 }
@@ -124,4 +124,25 @@ test('pending preflight cancellation waits for launch fencing and acknowledges s
 test('quota failover ignores quoted quota phrases without a structured machine error',async t=>{
   const x=await setup(t,{fixtureExitCode:1,record:{type:'result',result:'Documentation quoted: "quota exceeded"; retry policy is described here.'}});await assert.rejects(x.runner.run(job()),/execution failed/);
   assert.equal(x.events.some(item=>item.type==='quota_exhausted'),false);assert.ok(x.events.some(item=>item.type==='failed'));
+});
+
+test('structured provider usage emits bounded actual counts with a stable attempt event id',async t=>{
+  const x=await setup(t,{type:'turn.completed',turn_id:'turn-9',usage:{input_tokens:120,output_tokens:35,cached_input_tokens:20,total_cost_usd:0.000017}});
+  await x.runner.run(job());const usage=x.events.find(event=>event.type==='usage');assert.ok(usage);assert.equal(usage.data.inputTokens,120);assert.equal(usage.data.outputTokens,35);assert.equal(usage.data.cachedInputTokens,20);assert.equal(usage.data.costMicros,17);assert.match(usage.data.eventId,/^[a-f0-9]{40}$/);
+});
+
+test('usage with invalid counts or fabricated prose is not emitted',async t=>{
+  const x=await setup(t,{type:'turn.completed',usage:{input_tokens:-1,output_tokens:10}});await x.runner.run(job());assert.equal(x.events.some(event=>event.type==='usage'),false);
+});
+
+test('identical usage turns without provider ids retain separate stable stream positions',async t=>{
+  const turn={type:'turn.completed',usage:{input_tokens:12,output_tokens:3,cached_input_tokens:2}},x=await setup(t,{records:[turn,turn,{type:'item.completed',item:{type:'agent_message',text:'done'}}]});
+  await x.runner.run(job());const events=x.events.filter(event=>event.type==='usage');assert.equal(events.length,2);assert.notEqual(events[0].data.eventId,events[1].data.eventId);
+});
+
+test('provider subprocess environment excludes worker, database, and journal control secrets',async t=>{
+  const original={...process.env};t.after(()=>{for(const key of Object.keys(process.env))if(!(key in original))delete process.env[key];Object.assign(process.env,original)});
+  Object.assign(process.env,{GAS_TOWN_NODE_TOKEN:'node-secret-canary',DATABASE_URL:'db-secret-canary',CONSOLE_ADMIN_PASSWORD:'admin-secret-canary',GT_NODE_INVOCATION_JSON:'journal-secret-canary',OPENAI_API_KEY:'provider-login-canary'});
+  let childEnvironment;const x=await setup(t,{type:'result',result:'done'},{spawnImpl:(_command,_args,options)=>{childEnvironment=options.env;const c=new EventEmitter();c.stdout=new PassThrough();c.stderr=new PassThrough();c.pid=321;c.exitCode=null;c.kill=()=>true;setImmediate(()=>{c.emit('spawn');c.stdout.write('{"type":"result","result":"done"}\\n');c.exitCode=0;c.emit('close',0,null)});return c}});
+  await x.runner.run(job());assert.equal(childEnvironment.GAS_TOWN_NODE_TOKEN,undefined);assert.equal(childEnvironment.DATABASE_URL,undefined);assert.equal(childEnvironment.CONSOLE_ADMIN_PASSWORD,undefined);assert.equal(childEnvironment.GT_NODE_INVOCATION_JSON,undefined);assert.equal(childEnvironment.OPENAI_API_KEY,'provider-login-canary');
 });

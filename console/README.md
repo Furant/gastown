@@ -103,6 +103,16 @@ The encrypted plaintext envelope is limited to 8 MiB (including bundle encoding/
 
 Automatic quota failover remains same-node. Cross-node movement is an explicit user action, not an automatic transfer of code to another machine.
 
+## Members, usage and budgets
+
+Administrators can rename, disable and change roles for members, reset passwords and edit team membership. The last enabled administrator cannot be removed or demoted. Password resets invalidate existing sessions; changing your own password requires the current password. Removing a shared-team grant requests a stop for affected running tasks and waits for the node's stop acknowledgment.
+
+Project owners and administrators can set daily run, input/output token and recorded USD cost limits from the project page. Days use UTC. Planning and execution each count as a run when claimed. Token counts and costs come from structured provider output; unsupported cost reporting stays unknown, not zero. This does not query your Codex or Cursor subscription balance. A cost limit without any reported cost blocks new claims. Limits stop subsequent claims; in-flight work can exceed token or cost limits before reporting its usage.
+
+## Node restart recovery
+
+Workers persist private attempt journals in `.gastown-node-journals/` beside the local configuration, outside task worktrees. Treat these files as credentials because they contain attempt leases; keep the directory private and out of Git. A process lock prevents two workers from starting against the same configuration. On restart, the worker checks the recorded supervisor's PID, start time, process group and unique marker before stopping owned work. Confirmed stopped work becomes paused and requires explicit resume. An uncertain process identity or incomplete transfer remains `recovery_required`; investigate on the node before continuing. Recovery never automatically launches another writer.
+
 ## Verification
 
 ```sh

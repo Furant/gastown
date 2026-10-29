@@ -40,3 +40,23 @@ export function checkpointTargetReady(node, now = Date.now()) {
   if (!Number.isFinite(heartbeat) || now - heartbeat > 45_000 || heartbeat > now + 5_000) return { ready: false, reason: '目标节点心跳已过期。' };
   return { ready: true, reason: '' };
 }
+
+export function formatRecordedCost(micros) {
+  if (micros === null || micros === undefined || !Number.isFinite(Number(micros))) return '未报告';
+  return `${(Number(micros) / 1_000_000).toFixed(2)} USD`;
+}
+
+export function validateBudget(values) {
+  const limits = ['maxRunsPerDay', 'maxInputTokens', 'maxOutputTokens', 'maxRecordedCostMicros'];
+  for (const key of limits) {
+    const value = values[key];
+    if (value === '' || value === null || value === undefined) continue;
+    if (!Number.isSafeInteger(Number(value)) || Number(value) < 1) return '预算上限必须是大于 0 的整数，或留空。';
+  }
+  if (values.enabled && limits.every(key => values[key] === '' || values[key] == null)) return '启用预算时至少填写一项上限。';
+  return '';
+}
+
+export function taskLifecycleActionsFor(task) {
+  return task?.status === 'recovery_required' ? [] : taskLifecycleActions(task?.status);
+}

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { startNode, parseArgs, checkNode } from '../index.mjs';
+import { acquireNodeLock, writeJournal } from '../journal.mjs';
 
 test('node sends zero capacity while a leased task occupies its only slot',async()=>{
   const signalSource=new EventEmitter(),capacities=[],job={attemptId:'attempt-1',taskId:'task-1',leaseToken:'lease'};let finish;
@@ -44,4 +45,14 @@ test('node preflight checks local setup and authenticates without polling for wo
   let heartbeats=0,polls=0;const client={heartbeat:async()=>{heartbeats++},poll:async()=>{polls++}};const logs=[];
   await checkNode({serverUrl:'http://localhost:8768',projects:{p:{repoPath:repo,baseBranch:base}},tools:{codex:{command:process.execPath}},worktreesDir:home},{client,capabilities:{tools:[{tool:'codex',models:[{id:'fixture'}]}]},logger:{log:line=>logs.push(line)}});
   assert.equal(heartbeats,1);assert.equal(polls,0);assert.ok(logs.some(line=>line.includes('Server authentication: OK')));
+});
+
+test('restart recovery runs under the node lock before tool discovery can fail',async t=>{
+  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'town-startup-recovery-')),configPath=path.join(dir,'node.json');t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+  const order=[],signalSource=new EventEmitter(),client={recover:async body=>{order.push(['recover',body.outcome])}};
+  const config={configPath,nodeId:'fixture-node',worktreesDir:path.join(dir,'worktrees'),maxConcurrent:1,pollIntervalMs:1};
+  await writeJournal(config,{attemptId:'attempt-before-discovery',taskId:'task-before-discovery',leaseToken:'lease',phase:'preparing'});
+  await assert.rejects(startNode(config,{client,signalSource,discoverCapabilitiesImpl:async()=>{order.push(['discover']);throw new Error('fixture discovery failure')},logger:{error(){}}}),/fixture discovery failure/);
+  assert.deepEqual(order,[['recover','unknown'],['discover']]);
+  await acquireNodeLock(config).then(release=>release());
 });

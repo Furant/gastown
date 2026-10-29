@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import { createDatabase } from './db.mjs';
 import { createApp } from './app.mjs';
 import { generateCheckpointKeys, sealCheckpoint, openCheckpoint } from '../shared/checkpoint-crypto.mjs';
+import { changePassword } from './member-admin.mjs';
+import { hashPassword } from './auth.mjs';
 
 const fixtureCredentials = new Map();
 function fixturePassword(label) {
@@ -26,7 +28,7 @@ async function req(f, path, {method='GET',body,token,cookie,csrf}={}) {
   if(token) headers.authorization=`Bearer ${token}`;
   if(cookie) headers.cookie=cookie;
   if(csrf) headers['x-csrf-token']=csrf;
-  if(['POST','PATCH','DELETE'].includes(method)) headers.origin=f.base;
+  if(['POST','PATCH','PUT','DELETE'].includes(method)) headers.origin=f.base;
   const res=await fetch(f.base+path,{method,headers,body:body===undefined?undefined:JSON.stringify(body),redirect:'manual'});
   const json=await res.json();
   return {status:res.status,json,headers:res.headers};
@@ -86,6 +88,151 @@ test('bootstrap, user cookie, CSRF and second bootstrap rejection',async t=>{
  const cookie=first.headers.get('set-cookie').split(';')[0];
  assert.equal((await req(f,'/api/v1/projects',{method:'POST',cookie,body:{name:'X',repoUrl:'https://github.com/a/b.git',baseBranch:'main',visibility:'private'}})).status,403);
  assert.equal((await req(f,'/api/v1/projects',{method:'POST',cookie,csrf:first.json.data.csrfToken,body:{name:'X',repoUrl:'https://github.com/a/b.git',baseBranch:'main',visibility:'private'}})).status,201);
+});
+
+test('member disable revokes login, session and owned node credentials while protecting the last admin',async t=>{
+ const x=await ownerFixture(t);
+ const made=await req(x.f,'/api/v1/members',{method:'POST',...x.auth,body:{name:'Member',email:'disable@example.test',password:fixturePassword('disable-member-password')}});
+ const memberLogin=await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:'disable@example.test',password:fixturePassword('disable-member-password')}});
+ const memberAuth={cookie:memberLogin.headers.get('set-cookie').split(';')[0],csrf:memberLogin.json.data.csrfToken};
+ assert.equal((await req(x.f,`/api/v1/members/${made.json.data.id}`,{method:'PATCH',...memberAuth,body:{name:'Nope'}})).status,403);
+ assert.equal((await req(x.f,'/api/v1/members/'+(await req(x.f,'/api/v1/auth/me',{cookie:x.auth.cookie})).json.data.user.id,{method:'PATCH',...x.auth,body:{disabled:true}})).json.error.code,'self_disable_forbidden');
+ assert.equal((await req(x.f,'/api/v1/members/'+(await req(x.f,'/api/v1/auth/me',{cookie:x.auth.cookie})).json.data.user.id,{method:'PATCH',...x.auth,body:{role:'member'}})).json.error.code,'last_admin');
+ const node=await req(x.f,'/api/v1/nodes',{method:'POST',...memberAuth,body:{name:'Member node',visibility:'private',projectIds:[]}});
+ assert.equal(node.status,201);
+ const sharedNode=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Shared node',visibility:'custom',memberIds:[made.json.data.id],projectIds:[x.project]}});
+ assert.equal(sharedNode.status,201);
+ const disabled=await req(x.f,`/api/v1/members/${made.json.data.id}`,{method:'PATCH',...x.auth,body:{disabled:true}});
+ assert.equal(disabled.status,200);assert.ok(disabled.json.data.disabledAt);
+ assert.equal((await req(x.f,'/api/v1/auth/me',{cookie:memberAuth.cookie})).status,401);
+ assert.equal((await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:'disable@example.test',password:fixturePassword('disable-member-password')}})).status,401);
+ assert.equal((await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).status,200);
+ assert.equal((await req(x.f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{}})).status,401);
+ const nodes=(await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie})).json.data;
+ const scrubbed=nodes.find(item=>item.id===sharedNode.json.data.id);
+ assert.deepEqual(scrubbed.memberIds,[]);
+});
+
+test('password change verifies current password and invalidates other sessions; administrator reset invalidates all sessions',async t=>{
+ const x=await ownerFixture(t);
+ const newPassword=fixturePassword('change-password-long-enough');
+ const login=await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:'owner@example.test',password:fixturePassword('very-long-test-password')}});
+ const second={cookie:login.headers.get('set-cookie').split(';')[0],csrf:login.json.data.csrfToken};
+ assert.equal((await req(x.f,'/api/v1/auth/change-password',{method:'POST',...x.auth,body:{currentPassword:'incorrect-password',newPassword}})).status,403);
+ assert.equal((await req(x.f,'/api/v1/auth/change-password',{method:'POST',...x.auth,body:{currentPassword:fixturePassword('very-long-test-password'),newPassword}})).status,200);
+ assert.equal((await req(x.f,'/api/v1/auth/me',{cookie:second.cookie})).status,401);
+ const reset=await req(x.f,'/api/v1/members/'+(await req(x.f,'/api/v1/auth/me',{cookie:x.auth.cookie})).json.data.user.id+'/reset-password',{method:'POST',...x.auth,body:{password:fixturePassword('new-reset-password-long')}});
+ assert.equal(reset.status,200);
+ assert.equal((await req(x.f,'/api/v1/auth/me',{cookie:x.auth.cookie})).status,401);
+});
+
+test('password change cannot overwrite a reset that wins before its transaction lock',async t=>{
+ const x=await ownerFixture(t);
+ const owner=(await req(x.f,'/api/v1/auth/me',{cookie:x.auth.cookie})).json.data.user;
+ const resetPassword=fixturePassword('race-reset-password');
+ const changePasswordValue=fixturePassword('race-change-password');
+ const resetHash=await hashPassword(resetPassword);
+ const raceDb={
+  query:(...args)=>x.f.db.query(...args),
+  transaction:async fn=>{await x.f.db.query('UPDATE users SET password_hash=$2 WHERE id=$1',[owner.id,resetHash]);return x.f.db.transaction(fn)}
+ };
+ await assert.rejects(changePassword(raceDb,{id:owner.id,org_id:owner.organizationId},{currentPassword:fixturePassword('very-long-test-password'),newPassword:changePasswordValue},'preserve-session'),/Current password is incorrect/);
+ assert.equal((await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:owner.email,password:resetPassword}})).status,200);
+ assert.equal((await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:owner.email,password:changePasswordValue}})).status,401);
+});
+
+test('team edits require owner or admin and constrain membership to enabled same-organization users',async t=>{
+ const x=await ownerFixture(t);
+ const team=(await req(x.f,'/api/v1/teams',{cookie:x.auth.cookie})).json.data[0];
+ const created=await req(x.f,'/api/v1/members',{method:'POST',...x.auth,body:{name:'Teammate',email:'team@example.test',password:fixturePassword('team-member-password')}});
+ const updated=await req(x.f,`/api/v1/teams/${team.id}`,{method:'PATCH',...x.auth,body:{name:'Platform',memberIds:[created.json.data.id]}});
+ assert.equal(updated.status,200);assert.equal(updated.json.data.name,'Platform');assert.deepEqual(new Set(updated.json.data.memberIds),new Set([created.json.data.id,(await req(x.f,'/api/v1/auth/me',{cookie:x.auth.cookie})).json.data.user.id]));
+ assert.equal((await req(x.f,`/api/v1/teams/${team.id}`,{method:'PATCH',...x.auth,body:{memberIds:['outside-organization']}})).status,400);
+ const login=await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:'team@example.test',password:fixturePassword('team-member-password')}});
+ const memberAuth={cookie:login.headers.get('set-cookie').split(';')[0],csrf:login.json.data.csrfToken};
+ assert.equal((await req(x.f,`/api/v1/teams/${team.id}`,{method:'PATCH',...memberAuth,body:{name:'Hijack'}})).status,403);
+ const visibleTeam=(await req(x.f,'/api/v1/teams',{cookie:memberAuth.cookie})).json.data[0];
+ assert.ok(visibleTeam.memberIds.includes(created.json.data.id));
+ assert.ok(visibleTeam.memberIds.includes((await req(x.f,'/api/v1/auth/me',{cookie:x.auth.cookie})).json.data.user.id));
+});
+
+test('removing a member from a shared team requests worker stop and cancels without requeueing',async t=>{
+ const x=await ownerFixture(t);
+ const member=await req(x.f,'/api/v1/members',{method:'POST',...x.auth,body:{name:'Shared member',email:'shared@example.test',password:fixturePassword('shared-member-password')}});
+ const team=(await req(x.f,'/api/v1/teams',{cookie:x.auth.cookie})).json.data[0];
+ await req(x.f,`/api/v1/teams/${team.id}`,{method:'PATCH',...x.auth,body:{memberIds:[member.json.data.id]}});
+ const project=await req(x.f,'/api/v1/projects',{method:'POST',...x.auth,body:{name:'Team repo',repoUrl:'https://github.com/team/shared.git',baseBranch:'main',visibility:'custom',memberIds:[member.json.data.id]}});
+ const node=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Team runner',visibility:'team',teamId:team.id,projectIds:[project.json.data.id]}});
+ const caps={tools:[{tool:'codex',models:[{id:'codex-default',name:'Codex default',modes:['high']}]}]};
+ await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:node.json.data.token,body:{capabilities:caps}});
+ const conn=await req(x.f,'/api/v1/connections',{method:'POST',...x.auth,body:{name:'Team Codex',nodeId:node.json.data.id,tool:'codex',visibility:'custom',memberIds:[member.json.data.id],projectIds:[project.json.data.id],model:'codex-default',mode:'high',allowedModels:['codex-default'],allowOverride:false,maxConcurrency:1}});
+ const login=await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:'shared@example.test',password:fixturePassword('shared-member-password')}});
+ const memberAuth={cookie:login.headers.get('set-cookie').split(';')[0],csrf:login.json.data.csrfToken};
+ const made=await req(x.f,'/api/v1/tasks',{method:'POST',...memberAuth,body:{title:'Shared work',description:'Must stop when team access is removed',projectId:project.json.data.id,connectionId:conn.json.data.id}});
+ assert.equal(made.status,201,JSON.stringify(made.json));
+ const plan=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{}})).json.data.jobs[0];
+ await req(x.f,'/api/v1/worker/events',{method:'POST',token:node.json.data.token,body:{attemptId:plan.attemptId,leaseToken:plan.leaseToken,type:'plan_ready',data:{summary:'Plan',steps:[{title:'Work',acceptance:'Done'}]}}});
+ await req(x.f,`/api/v1/tasks/${made.json.data.id}/approve`,{method:'POST',...memberAuth,body:{allowPush:false,allowPR:false}});
+ const run=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{}})).json.data.jobs[0];
+ assert.equal(run.kind,'execute');
+ const queued=await req(x.f,'/api/v1/tasks',{method:'POST',...memberAuth,body:{title:'Queued shared work',description:'Must not be claimed after access is removed',projectId:project.json.data.id,connectionId:conn.json.data.id}});
+ assert.equal(queued.status,201);
+ const baseTransaction=x.f.db.transaction.bind(x.f.db);
+ let markLocked,releaseLocked;
+ const orgLockHeld=new Promise(resolve=>{markLocked=resolve});
+ const allowTeamEdit=new Promise(resolve=>{releaseLocked=resolve});
+ const transactionQueries=[];
+ let gate=true;
+ x.f.db.transaction=fn=>baseTransaction(tx=>fn({query:async(sql,params)=>{transactionQueries.push(sql);const result=await tx.query(sql,params);if(gate&&sql.includes('SELECT id FROM orgs WHERE id=$1 FOR UPDATE')){gate=false;markLocked();await allowTeamEdit;}return result}}));
+ const removalPromise=req(x.f,`/api/v1/teams/${team.id}`,{method:'PATCH',...x.auth,body:{memberIds:[]}});
+ await orgLockHeld;
+ const pollPromise=req(x.f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{}});
+ releaseLocked();
+ const [removed,racedPoll]=await Promise.all([removalPromise,pollPromise]);
+ x.f.db.transaction=baseTransaction;
+ assert.equal(removed.status,200);
+ assert.match(transactionQueries[0],/SELECT id FROM orgs .*FOR UPDATE/);
+ assert.ok(transactionQueries.some(sql=>sql.includes('SELECT * FROM teams WHERE id=$1 AND org_id=$2 FOR UPDATE')));
+ assert.ok(transactionQueries.some(sql=>sql.includes('SELECT id FROM nodes WHERE id=$1 FOR UPDATE')));
+ assert.equal(racedPoll.json.data.jobs.length,0);
+ assert.equal(racedPoll.json.data.cancellations[0].reason,'cancel');
+ assert.equal((await x.f.db.query('SELECT status FROM tasks WHERE id=$1',[queued.json.data.id])).rows[0].status,'planning_queued');
+ const cancel=racedPoll.json.data.cancellations[0];
+ assert.equal(cancel.reason,'cancel');
+ const flushed=await req(x.f,'/api/v1/worker/events',{method:'POST',token:node.json.data.token,body:{attemptId:run.attemptId,leaseToken:run.leaseToken,type:'usage',data:{eventId:'final-usage',inputTokens:11,outputTokens:4}}});
+ assert.equal(flushed.status,200);assert.equal(flushed.json.data.duplicate,false);
+ assert.equal((await req(x.f,'/api/v1/worker/events',{method:'POST',token:node.json.data.token,body:{attemptId:run.attemptId,leaseToken:run.leaseToken,type:'stopped'}})).json.data.status,'canceled');
+ assert.equal((await req(x.f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{}})).json.data.jobs.length,0);
+});
+
+test('usage reports idempotent actual measurements and budget blocks later planning or execution claims',async t=>{
+ const x=await ownerFixture(t);
+ const budget=await req(x.f,`/api/v1/projects/${x.project}/budget`,{method:'PUT',...x.auth,body:{enabled:true,maxRunsPerDay:1}});
+ assert.equal(budget.status,200);assert.equal(budget.json.data.timezone,'UTC');
+ const task=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Budget task',description:'Track actual usage',projectId:x.project,connectionId:x.source}});
+ const planning=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.jobs[0];
+ const usage={attemptId:planning.attemptId,leaseToken:planning.leaseToken,type:'usage',data:{eventId:'usage-1',inputTokens:100,outputTokens:20,cachedInputTokens:8,costMicros:55}};
+ assert.equal((await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:usage})).json.data.duplicate,false);
+ assert.equal((await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:usage})).json.data.duplicate,true);
+ const totals=await req(x.f,`/api/v1/usage?projectId=${x.project}`,{cookie:x.auth.cookie});
+ assert.equal(totals.json.data.inputTokens,100);assert.equal(totals.json.data.recordedCostMicros,55);assert.equal(totals.json.data.costCoverage.unknownRuns,0);
+ await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:planning.attemptId,leaseToken:planning.leaseToken,type:'plan_ready',data:{summary:'Plan',steps:[{title:'Work',acceptance:'Done'}]}}});
+ await req(x.f,`/api/v1/tasks/${task.json.data.id}/approve`,{method:'POST',...x.auth,body:{allowPush:false,allowPR:false}});
+ assert.equal((await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.jobs.length,0);
+ const listed=await req(x.f,'/api/v1/tasks',{cookie:x.auth.cookie});
+ assert.match(listed.json.data.find(row=>row.id===task.json.data.id).budgetBlockReason,/run limit/i);
+ assert.equal((await req(x.f,`/api/v1/projects/${x.project}/budget`,{cookie:x.auth.cookie})).json.data.maxRunsPerDay,1);
+});
+
+test('worker recovery pauses verified stopped work and fences unknown work without a duplicate claim',async t=>{
+ const x=await approvedRunning(t);
+ const unknown=await req(x.f,'/api/v1/worker/recover',{method:'POST',token:x.token,body:{attemptId:x.attempt.attemptId,leaseToken:x.attempt.leaseToken,outcome:'unknown',message:'PID identity could not be verified'}});
+ assert.equal(unknown.status,200);assert.equal(unknown.json.data.status,'recovery_required');
+ assert.equal((await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.jobs.length,0);
+ const task=(await req(x.f,`/api/v1/tasks/${x.task}`,{cookie:x.auth.cookie})).json.data;
+ assert.equal(task.status,'recovery_required');assert.equal(task.currentAttemptId,x.attempt.attemptId);
+ const stopped=await req(x.f,'/api/v1/worker/recover',{method:'POST',token:x.token,body:{attemptId:x.attempt.attemptId,leaseToken:x.attempt.leaseToken,outcome:'stopped'}});
+ assert.equal(stopped.status,200);assert.equal(stopped.json.data.status,'paused');
 });
 
 test('node credentials stay private and shared node credentials cannot be repurposed by another account',async t=>{
