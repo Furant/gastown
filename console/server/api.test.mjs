@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDatabase } from './db.mjs';
 import { createApp } from './app.mjs';
+import { generateCheckpointKeys, sealCheckpoint, openCheckpoint } from '../shared/checkpoint-crypto.mjs';
 
 const fixtureCredentials = new Map();
 function fixturePassword(label) {
@@ -118,6 +119,66 @@ test('plans wait for human approval and tasks inherit the connection model setti
  assert.equal((await req(x.f,`/api/v1/tasks/${made.json.data.id}/approve`,{method:'POST',...x.auth,body:{allowPush:true,allowPR:true}})).status,200);
  poll=await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}});
  assert.equal(poll.json.data.jobs[0].kind,'execute');
+});
+
+test('task pause waits for worker stop acknowledgment and retry starts a fresh generation',async t=>{
+ const x=await ownerFixture(t);
+ const made=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Pause me',description:'Keep work resumable',projectId:x.project,connectionId:x.source}});
+ const planning=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.jobs[0];
+ const pause=await req(x.f,`/api/v1/tasks/${made.json.data.id}/pause`,{method:'POST',...x.auth});
+ assert.equal(pause.status,202);assert.equal(pause.json.data.status,'stopping');
+ const cancel=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.cancellations[0];
+ assert.equal(cancel.reason,'pause');
+ await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:planning.attemptId,leaseToken:planning.leaseToken,type:'stopped',data:{}}});
+ assert.equal((await req(x.f,`/api/v1/tasks/${made.json.data.id}`,{cookie:x.auth.cookie})).json.data.status,'paused');
+ assert.equal((await req(x.f,`/api/v1/tasks/${made.json.data.id}/resume`,{method:'POST',...x.auth})).json.data.status,'planning_queued');
+ assert.equal((await req(x.f,`/api/v1/tasks/${made.json.data.id}/cancel`,{method:'POST',...x.auth})).json.data.status,'canceled');
+ const retry=await req(x.f,`/api/v1/tasks/${made.json.data.id}/retry`,{method:'POST',...x.auth});
+ assert.equal(retry.json.data.retryGeneration,1);assert.equal(retry.json.data.status,'planning_queued');
+});
+
+test('decomposition validates DAG and parent approval schedules only dependency roots',async t=>{
+ const x=await ownerFixture(t);
+ const made=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Workflow',description:'Parent plan',projectId:x.project,connectionId:x.source}});
+ const plan=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.jobs[0];
+ await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:plan.attemptId,leaseToken:plan.leaseToken,type:'plan_ready',data:{summary:'Split work',steps:[{title:'A',acceptance:'A'},{title:'B',acceptance:'B'}]}}});
+ const cyclic=await req(x.f,`/api/v1/tasks/${made.json.data.id}/decompose`,{method:'POST',...x.auth,body:{children:[{key:'a',title:'A',description:'Do A',connectionId:x.source,dependsOn:['b']},{key:'b',title:'B',description:'Do B',connectionId:x.target,dependsOn:['a']}]}});
+ assert.equal(cyclic.status,400);
+ const decomposition=await req(x.f,`/api/v1/tasks/${made.json.data.id}/decompose`,{method:'POST',...x.auth,body:{children:[{key:'a',title:'A',description:'Do A',connectionId:x.source,dependsOn:[]},{key:'b',title:'B',description:'Do B',connectionId:x.target,dependsOn:['a']}]}});
+ assert.equal(decomposition.status,201);assert.equal(decomposition.json.data.children.length,2);
+ const detail=await req(x.f,`/api/v1/tasks/${made.json.data.id}`,{cookie:x.auth.cookie});assert.equal(detail.json.data.children.find(c=>c.key==='b').dependsOn[0],'a');
+ const approved=await req(x.f,`/api/v1/tasks/${made.json.data.id}/approve`,{method:'POST',...x.auth,body:{allowPush:false,allowPR:false}});assert.equal(approved.json.data.status,'orchestrating');
+ const jobs=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:2}})).json.data.jobs;
+ assert.equal(jobs.length,1);assert.equal(jobs[0].title,'A');
+ await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:jobs[0].attemptId,leaseToken:jobs[0].leaseToken,type:'completed',data:{branch:'feature/a',summary:'A complete'}}});
+ const dependent=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:2}})).json.data.jobs[0];
+ assert.equal(dependent.title,'B');assert.equal(dependent.dependencyResults[0].key,'a');assert.equal(dependent.dependencyResults[0].branch,'feature/a');assert.equal(dependent.dependencyResults[0].result.branch,'feature/a');
+ const pause=await req(x.f,`/api/v1/tasks/${made.json.data.id}/pause`,{method:'POST',...x.auth});assert.equal(pause.status,202);
+ const stop=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.cancellations.find(c=>c.taskId===dependent.taskId);assert.equal(stop.reason,'pause');
+ await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:dependent.attemptId,leaseToken:dependent.leaseToken,type:'stopped',data:{}}});
+ assert.equal((await req(x.f,`/api/v1/tasks/${made.json.data.id}`,{cookie:x.auth.cookie})).json.data.status,'paused');
+ await req(x.f,`/api/v1/tasks/${made.json.data.id}/resume`,{method:'POST',...x.auth});
+ assert.equal((await req(x.f,`/api/v1/tasks/${made.json.data.id}`,{cookie:x.auth.cookie})).json.data.status,'orchestrating');
+});
+
+test('cross-node handoff stores ciphertext and releases target only after stop acknowledgment',async t=>{
+ const x=await approvedRunning(t),keys=generateCheckpointKeys();
+ const targetNode=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Target node',visibility:'private',projectIds:[x.project]}});
+ const targetToken=targetNode.json.data.token,targetId=targetNode.json.data.id;
+ const caps=(await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:x.token,body:{capabilities:{tools:[{tool:'codex',models:[{id:'codex-default',name:'Codex',modes:['low','high']}]},{tool:'cursor',models:[{id:'cursor-default',name:'Cursor',modes:['fast','deep']}]}]}}}));assert.equal(caps.status,200);
+ await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:targetToken,body:{checkpointPublicKey:keys.publicKey,capabilities:{tools:[{tool:'codex',models:[{id:'codex-default',name:'Codex',modes:['low','high']}]},{tool:'cursor',models:[{id:'cursor-default',name:'Cursor',modes:['fast','deep']}]}]}}});
+ const connection=await req(x.f,'/api/v1/connections',{method:'POST',...x.auth,body:{name:'Remote Codex',nodeId:targetId,tool:'codex',visibility:'private',projectIds:[x.project],model:'codex-default',mode:'high',allowedModels:['codex-default'],allowOverride:true,maxConcurrency:1}});assert.equal(connection.status,201);
+ const transfer=await req(x.f,`/api/v1/tasks/${x.task}/transfer`,{method:'POST',...x.auth,body:{connectionId:connection.json.data.id}});assert.equal(transfer.status,202);
+ const sourceStop=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.cancellations[0];assert.equal(sourceStop.handoff.targetNodeId,targetId);
+ const context={taskId:x.task,projectId:x.project,sourceAttemptId:x.attempt.attemptId,targetNodeId:targetId,transferId:sourceStop.handoff.transferId};
+ const envelope=sealCheckpoint(Buffer.from('safe checkpoint bytes'),keys.publicKey,context);
+ const uploaded=await req(x.f,'/api/v1/worker/checkpoints',{method:'POST',token:x.token,body:{attemptId:x.attempt.attemptId,leaseToken:x.attempt.leaseToken,transferId:context.transferId,envelope}});assert.equal(uploaded.status,201);
+ const stopped=await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:x.attempt.attemptId,leaseToken:x.attempt.leaseToken,type:'stopped',data:{checkpoint:{checkpointId:uploaded.json.data.checkpointId,digest:uploaded.json.data.digest,transferId:context.transferId,branch:'feature/task',dirty:true}}}});assert.equal(stopped.status,200);
+ const job=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:targetToken,body:{}})).json.data.jobs[0];assert.equal(job.checkpoint.checkpointId,uploaded.json.data.checkpointId);assert.equal(job.checkpoint.targetNodeId,targetId);
+ const read=await req(x.f,`/api/v1/worker/checkpoints/${uploaded.json.data.checkpointId}/read`,{method:'POST',token:targetToken,body:{attemptId:job.attemptId,leaseToken:job.leaseToken}});assert.equal(read.status,200);assert.equal(openCheckpoint(read.json.data.envelope,keys.privateKey,context).toString(),'safe checkpoint bytes');
+ const detail=await req(x.f,`/api/v1/tasks/${x.task}`,{cookie:x.auth.cookie});assert.equal(JSON.stringify(detail.json).includes('ciphertext'),false);
+ await x.f.db.query('UPDATE connections SET revoked_at=now() WHERE id=$1',[connection.json.data.id]);
+ const revokedRead=await req(x.f,`/api/v1/worker/checkpoints/${uploaded.json.data.checkpointId}/read`,{method:'POST',token:targetToken,body:{attemptId:job.attemptId,leaseToken:job.leaseToken}});assert.equal(revokedRead.status,409);
 });
 
 test('handoff cannot start target before source stop ack; preserves one current writer',async t=>{

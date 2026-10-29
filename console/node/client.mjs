@@ -6,8 +6,8 @@ export class WorkerApiError extends Error{
 
 export class WorkerClient{
   constructor({serverUrl,token,fetchImpl=fetch,timeoutMs=API_TIMEOUT_MS}){this.serverUrl=serverUrl.replace(/\/$/,'');this.token=token;this.fetchImpl=fetchImpl;this.timeoutMs=timeoutMs}
-  async request(route,body){
-    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),this.timeoutMs);
+  async request(route,body,timeoutMs=this.timeoutMs){
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);
     try{
       const response=await this.fetchImpl(this.serverUrl+'/api/v1/worker/'+route,{method:'POST',headers:{authorization:`Bearer ${this.token}`,'content-type':'application/json'},body:JSON.stringify(body),signal:controller.signal});
       let payload;try{payload=await response.json()}catch{throw new WorkerApiError(`Worker API returned invalid JSON (${response.status})`,{status:response.status})}
@@ -16,7 +16,9 @@ export class WorkerClient{
       return payload.data;
     }catch(error){if(error.name==='AbortError')throw new Error('Worker API request timed out');throw error}finally{clearTimeout(timer)}
   }
-  heartbeat(capabilities){return this.request('heartbeat',{capabilities})}
+  heartbeat(capabilities,checkpointPublicKey){return this.request('heartbeat',{capabilities,...(checkpointPublicKey?{checkpointPublicKey}:{})})}
   poll({capacity=1}={}){return this.request('poll',{capacity})}
   event(body){return this.request('events',body)}
+  uploadCheckpoint(body){return this.request('checkpoints',body,60000)}
+  readCheckpoint(id,body){if(!/^[A-Za-z0-9_-]{1,120}$/.test(id))throw new Error('Invalid checkpoint id');return this.request(`checkpoints/${encodeURIComponent(id)}/read`,body,60000)}
 }

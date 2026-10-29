@@ -5,3 +5,4 @@ node_modules/
 coverage/
 *.log
 node-config.json
+checkpoint-keys.json

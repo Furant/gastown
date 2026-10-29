@@ -102,13 +102,26 @@ console.log(JSON.stringify({type:'result',result:'Preserved original changes; ta
   assert.equal((await request('/tasks/' + task.id)).data.status, 'awaiting_approval');
   assert.equal((await client.poll({ capacity: 1 })).jobs.length, 0, 'implementation must not start before human approval');
   await request('/tasks/' + task.id + '/approve', { allowPush: false, allowPR: false });
-  const execution = (await client.poll({ capacity: 1 })).jobs[0];
-  const sourceResult = runner.run(execution).then(value => ({ value }), error => ({ error }));
+  let execution = (await client.poll({ capacity: 1 })).jobs[0];
+  let sourceResult = runner.run(execution).then(value => ({ value }), error => ({ error }));
   await eventually(async () => {
     const session = runner.running.get(execution.attemptId);
     return session && await readFile(join(session.worktree.path, 'source-dirty.txt'), 'utf8').catch(() => '') === 'preserve this uncommitted content';
   }, 'source fixture dirty file');
   const sourcePath = runner.running.get(execution.attemptId).worktree.path;
+  await request('/tasks/' + task.id + '/pause', {});
+  const pauseRequest = (await client.poll({ capacity: 0 })).cancellations[0];
+  assert.equal(pauseRequest.reason, 'pause');
+  await runner.cancel(pauseRequest);
+  assert.ok((await sourceResult).error);
+  assert.equal((await request('/tasks/' + task.id)).data.status, 'paused');
+  assert.equal((await client.poll({ capacity: 1 })).jobs.length, 0, 'paused work must not be automatically reclaimed');
+  assert.equal(await readFile(join(sourcePath, 'source-dirty.txt'), 'utf8'), 'preserve this uncommitted content');
+  await request('/tasks/' + task.id + '/resume', {});
+  execution = (await client.poll({ capacity: 1 })).jobs[0];
+  sourceResult = runner.run(execution).then(value => ({ value }), error => ({ error }));
+  await eventually(async () => runner.running.has(execution.attemptId), 'resumed source process');
+  assert.equal(runner.running.get(execution.attemptId).worktree.path, sourcePath, 'resume must preserve the same worktree');
   await request('/tasks/' + task.id + '/transfer', { connectionId: target.id });
   const beforeStop = await client.poll({ capacity: 1 });
   assert.equal(beforeStop.jobs.length, 0, 'target must not start while source is alive');

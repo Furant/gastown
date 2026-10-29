@@ -47,11 +47,12 @@ function taskFolder(project, taskId) {
   return path.join(project.worktreesDir, repoKey, taskKey);
 }
 
-export async function ensureWorktree(project, taskId) {
+export async function ensureWorktree(project, taskId, { mustBeNew = false, allowExistingCheckpoint = false } = {}) {
   const branch = taskBranch(taskId);
   const target = taskFolder(project, taskId);
   await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
   if (await fs.stat(target).then(x => x.isDirectory()).catch(() => false)) {
+    if (mustBeNew && !allowExistingCheckpoint) throw new Error('Checkpoint target task already has a worktree; refusing unrelated restore or replay');
     const actualPath = await fs.realpath(target);
     if (actualPath !== target) throw new Error('Task worktree path resolves outside the configured worktree directory');
     const [top, actualBranch, commonDir] = await Promise.all([
@@ -61,16 +62,17 @@ export async function ensureWorktree(project, taskId) {
     ]);
     const expectedCommonDir = await git(project.repoPath, ['rev-parse', '--git-common-dir']);
     if (path.resolve(top) !== target || actualBranch !== branch || path.resolve(target, commonDir) !== path.resolve(project.repoPath, expectedCommonDir)) throw new Error('Existing task worktree does not match the requested project and branch');
-    return { path: target, branch, project };
+    return { path: target, branch, project, created: false };
   }
   if (await fs.lstat(target).then(() => true).catch(() => false)) throw new Error('Task worktree path exists and is not a directory');
   const branchExists = await git(project.repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]).then(() => true).catch(error => {
     if (error.code === 1) return false;
     throw new Error('Unable to check existing task branch');
   });
+  if (mustBeNew && branchExists) throw new Error('Checkpoint target task branch already exists; refusing unrelated restore or replay');
   if (branchExists) await git(project.repoPath, ['worktree', 'add', target, branch]);
   else await git(project.repoPath, ['worktree', 'add', '-b', branch, target, project.baseBranch]);
-  return { path: target, branch, project };
+  return { path: target, branch, project, created: true };
 }
 
 export async function makeCheckpoint(worktree) {

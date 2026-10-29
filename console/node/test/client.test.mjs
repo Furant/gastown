@@ -23,3 +23,10 @@ test('poll sends available capacity so the server never leases work the node can
   let body;const client=new WorkerClient({serverUrl:'http://localhost',token:'node-secret',fetchImpl:async(_url,init)=>{body=JSON.parse(init.body);return{ok:true,json:async()=>({data:{jobs:[],cancellations:[]}})}}});
   await client.poll({capacity:0});assert.deepEqual(body,{capacity:0});
 });
+
+test('checkpoint upload and target read use the authenticated worker routes with transfer timeout',async()=>{
+  const requests=[];const client=new WorkerClient({serverUrl:'http://localhost:8768',token:'node-secret',fetchImpl:async(url,init)=>{requests.push({url,init});return{ok:true,json:async()=>({data:{checkpointId:'checkpoint-1',digest:'a'.repeat(64),envelope:{version:1}}})}}});
+  const upload={attemptId:'a',leaseToken:'l',transferId:'t',envelope:{version:1}};await client.uploadCheckpoint(upload);await client.readCheckpoint('checkpoint-1',{attemptId:'b',leaseToken:'m'});
+  assert.equal(requests[0].url,'http://localhost:8768/api/v1/worker/checkpoints');assert.equal(requests[1].url,'http://localhost:8768/api/v1/worker/checkpoints/checkpoint-1/read');assert.equal(requests[0].init.headers.authorization,'Bearer node-secret');assert.equal(requests[0].init.signal.aborted,false);
+  assert.throws(()=>client.readCheckpoint('../other',{}),/Invalid checkpoint id/);
+});

@@ -8,7 +8,7 @@ import { PassThrough } from 'node:stream';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { execFileSync } from 'node:child_process';
 import { AgentRunner } from '../runner.mjs';
-import { ensureWorktree } from '../workspace.mjs';
+import { ensureWorktree, resolveProject } from '../workspace.mjs';
 
 async function setup(t, output, runnerOptions={}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'town-runner-')), repo = path.join(dir, 'repo'), home = path.join(dir, 'worktrees');
@@ -43,6 +43,24 @@ test('PR completion is reported only with verified URL evidence',async t=>{
 test('PR output text without authoritative verification is never reported as completed',async t=>{
   const x=await setup(t,{type:'result',result:'https://github.com/team/repo/pull/12'}, {verifyPullRequestImpl:async()=>{throw new Error('gh verification unavailable')}});
   await assert.rejects(x.runner.run(job({allowPush:true,allowPR:true})),/gh verification unavailable/);assert.equal(x.events.some(event=>event.type==='completed'),false);assert.ok(x.events.some(event=>event.type==='failed'));
+});
+
+test('pause and cancel during delayed PR verification stop the already-exited attempt before completion',async t=>{
+  for(const reason of ['pause','cancel']){
+    let release,entered;const waiting=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve),url='https://github.com/team/repo/pull/12';
+    const x=await setup(t,{type:'result',result:'PR created'},{verifyPullRequestImpl:async()=>{entered();await gate;return url}});
+    const running=x.runner.run(job({allowPush:true,allowPR:true}));await waiting;
+    await x.runner.cancel({attemptId:'attempt-1',leaseToken:'opaque-lease',reason});release();
+    await assert.rejects(running,/stopped/i);assert.ok(x.events.some(event=>event.type==='stopped'&&event.data.reason===reason));assert.equal(x.events.some(event=>event.type==='completed'),false);assert.equal(x.runner.running.has('attempt-1'),false);
+  }
+});
+
+test('a completion rejected by a concurrent stop intent keeps the exited session until stop acknowledgment',async t=>{
+  const x=await setup(t,{type:'result',result:'Task done'}),events=x.events,original=x.runner.client.event.bind(x.runner.client);
+  x.runner.client.event=async body=>{if(body.type==='completed'){const error=new Error('stop intent won completion race');error.status=409;error.code='stale_attempt';throw error}return original(body)};
+  await assert.rejects(x.runner.run(job()),/stop intent won/);assert.equal(x.runner.running.has('attempt-1'),true);assert.equal(x.runner.pending.has('attempt-1'),true);
+  await x.runner.cancel({attemptId:'attempt-1',leaseToken:'opaque-lease',reason:'cancel'});
+  assert.ok(events.some(event=>event.type==='stopped'&&event.data.reason==='cancel'));assert.equal(events.some(event=>event.type==='completed'),false);assert.equal(x.runner.running.has('attempt-1'),false);assert.equal(x.runner.pending.has('attempt-1'),false);
 });
 
 test('quota failover event includes a checkpoint after process-group cleanup',async t=>{
@@ -94,6 +112,13 @@ test('shutdown during delayed workspace preparation prevents the paid tool from 
   let release,entered;const waiting=new Promise(resolve=>{entered=resolve}),gate=new Promise(resolve=>{release=resolve});
   const x=await setup(t,null,{ensureWorktreeImpl:async(...args)=>{entered();await gate;return ensureWorktree(...args)}});
   const pending=x.runner.run(job());await waiting;await x.runner.shutdown();release();await assert.rejects(pending,/shutting down/i);assert.equal(x.child(),undefined);
+});
+
+test('pending preflight cancellation waits for launch fencing and acknowledges stopped without spawning',async t=>{
+  let release,entered;const waiting=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);let spawned=false;
+  const x=await setup(t,null,{resolveProjectImpl:async(config,id)=>{entered();await gate;return resolveProject(config,id)},spawnImpl:()=>{spawned=true;throw new Error('must not spawn')}});
+  const running=x.runner.run(job()),cancelled=x.runner.cancel({attemptId:'attempt-1',leaseToken:'opaque-lease',reason:'pause'});await waiting;release();await cancelled;await assert.rejects(running,/cancelled before process launch|stopped/i);
+  assert.equal(spawned,false);assert.ok(x.events.some(event=>event.type==='stopped'&&event.data.reason==='pause'));
 });
 
 test('quota failover ignores quoted quota phrases without a structured machine error',async t=>{

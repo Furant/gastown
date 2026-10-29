@@ -77,11 +77,31 @@ Connections and projects start private. Owners may separately share them with a 
 
 Creating a task queues a planning job. An execution node calls the selected CLI in planning mode. Review the returned plan and explicitly approve execution, commits/push and PR creation. No task receives merge authorization. Observe task events and errors in the task detail view.
 
-Manual transfer checks target permissions and uses target model settings. For an active source, the task enters `stopping`; the node must terminate the original process group and acknowledge a worktree checkpoint before the target can be claimed. A missing stop acknowledgment does not permit a second writer. Transfers are restricted to connections on the same execution node. Cross-node checkpoint transport remains a separate milestone; unsupported operations return explicit errors.
+Manual transfer checks target permissions and uses target model settings. For an active source, the task enters `stopping`; the node must terminate the original process group and acknowledge a worktree checkpoint before the target can be claimed. A missing stop acknowledgment does not permit a second writer. Both same-node and explicitly requested cross-node transfers are supported, subject to the checkpoint constraints below.
 
 Automatic same-node quota handoff is opt-in for each task and both source/target connections. It requires a structured tool quota error, a verified stopped process group, a worktree checkpoint and currently valid permissions. Each exhausted connection is excluded from automatic retries for that task, preventing a loop between exhausted accounts. When no eligible connection remains, the task stays blocked for human intervention. Ordinary network errors and quoted quota messages do not trigger a switch. PR-authorized jobs report success only after `gh pr view` verifies the PR belongs to the expected repository and task/base branches; install and authenticate GitHub CLI on nodes where PR delivery is enabled.
 
 The worker creates a task Git worktree and preserves it for continuation. It does not reset or clean the user's checkout. Repository pushes and PR creation may incur external side effects only after task approval permits them. The console does not approve or merge PRs automatically.
+
+## Pause, resume, cancel and retry
+
+Use task-detail actions to pause/cancel queued work or request a process-group stop for active work. An active task remains `stopping` until its node acknowledges the stop; the UI does not pretend that sending a request has stopped a process. Resume preserves work and the approved plan. Explicit retries use a new quota-failover generation, so recovered connections can be tried again. A parent workflow can pause/cancel its children and waits for active children's stop acknowledgments.
+
+## Multi-agent task dependencies
+
+After a parent plan is ready, choose decomposition and edit 1–12 child tasks with their tool connections and dependency keys. The console rejects cyclic dependencies and unauthorized connections. Confirming the parent plan starts eligible root tasks; dependent children wait for prerequisite results. Each agent has an independent worktree. Downstream jobs receive prerequisite summaries, branches and PR references as context.
+
+Dependency edges determine scheduling; they do **not** merge code. Make code integration an explicit child task and review its diff/tests. The parent remains awaiting human review when its children finish. Current workflow decomposition is human-editable; it is not an autonomous code-merging system.
+
+## Cross-node checkpoints
+
+Start both nodes with the updated worker. They report a public X25519 key on heartbeat; the private key is written as `checkpoint-keys.json` beside the protected node configuration with mode 0600. Keep this file on that node and back it up securely; do not upload it to the console or commit it to a repository. Deleting it prevents decryption of checkpoints already addressed to that node.
+
+The target must be online, have a fresh key/heartbeat, and be authorized for the same project and selected tool. After the source process group stops, the worker exports current Git work using a temporary index/ref without changing its real HEAD/index. It encrypts the checkpoint for the target and uploads ciphertext only. Task, project, source attempt, transfer and target-node identities are cryptographically bound. The target checks its leased attempt, digest and recipient context before restoring into an isolated task worktree. Staged, unstaged and untracked source changes are retained; the user's main checkout is not overwritten.
+
+The encrypted plaintext envelope is limited to 8 MiB (including bundle encoding/metadata). Bundles contain only changes after the mapped shared baseline, which the target clone must already possess. Sensitive-looking paths in current changes or source commit history, symlinks, submodules, missing baselines and unrelated existing target worktrees cause explicit rejection. The system does not bypass an offline source or discard a conflicting target worktree. Failed restore or incompatible existing state may require manual repair before retrying; source work and the encrypted checkpoint remain available.
+
+Automatic quota failover remains same-node. Cross-node movement is an explicit user action, not an automatic transfer of code to another machine.
 
 ## Verification
 

@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { buildInvocation, parsePlan } from './tools.mjs';
 import { ensureWorktree, makeCheckpoint, resolveProject } from './workspace.mjs';
+import { exportCheckpoint, importCheckpoint, hasCheckpointState } from './checkpoint.mjs';
 
 const OUTPUT_LIMIT=256*1024, LINE_LIMIT=32*1024, LOG_LIMIT=3500;
 const execFileAsync=promisify(execFile);
@@ -32,13 +33,19 @@ function makePrompt(job) {
     'Return only JSON shaped as {"summary":"...","steps":[{"title":"...","acceptance":"..."}]}. Provide 1-12 concrete steps with verifiable acceptance conditions.',
     'Task: '+job.title,'Request: '+job.description
   ].join('\n\n');
-  const steps=job.plan.steps.map((step,i)=>(i+1)+'. '+step.title+': '+step.acceptance).join('\n');
+  const approvedSteps=Array.isArray(job.plan?.steps)?job.plan.steps:[{title:job.title,acceptance:job.description}];
+  const steps=approvedSteps.map((step,i)=>(i+1)+'. '+step.title+': '+step.acceptance).join('\n');
   const delivery=job.allowPR?'After tests, commit and push only this task branch. Create a pull request against the mapped project default branch. Report its URL. NEVER merge it.':job.allowPush?'After tests, commit and push only this task branch. Do not open or merge a pull request.':'Do not commit, push, create a pull request, or merge.';
+  const dependencyList=Array.isArray(job.dependencies)?job.dependencies:job.dependencyResults;
+  const dependencies=Array.isArray(dependencyList)?dependencyList.map(dep=>({title:dep.title,summary:dep.summary,branch:dep.branch,prUrl:dep.prUrl,status:dep.status})):[];
+  const parentPlan=job.parentPlan&&Array.isArray(job.parentPlan.steps)?job.parentPlan.steps.slice(0,12).map(step=>({title:step.title,acceptance:step.acceptance})):[];
   return [
     'Implement only the human-approved task plan below in this isolated worktree.',
     'Preserve existing project instructions and unrelated changes. Never switch branches, clean the worktree, amend commits or modify the default branch.',
     'Run relevant tests and report factual results and remaining issues.',delivery,
-    'Task: '+job.title,'Request: '+job.description,'Approved plan:\n'+steps
+    'Task: '+job.title,'Request: '+job.description,'Approved plan:\n'+steps,
+    ...(parentPlan.length?['Accepted parent plan (scope boundary; implement only this child assignment):\n'+JSON.stringify(parentPlan)]:[]),
+    ...(dependencies.length?['Dependency results (context only; do not merge branches silently):\n'+JSON.stringify(dependencies)]:[])
   ].join('\n\n');
 }
 function processSignal(child,signal,platform=process.platform) {
@@ -58,14 +65,14 @@ async function verifyPullRequest(worktree){
 }
 
 export class AgentRunner {
-  constructor({config,capabilities,client,spawnImpl=nodeSpawn,signalProcess,forceSignalProcess,processGroupAlive:groupAlive=processGroupAlive,verifyPullRequestImpl=verifyPullRequest,resolveProjectImpl=resolveProject,ensureWorktreeImpl=ensureWorktree,stopTimeoutMs=8000,logger=console}){
+  constructor({config,capabilities,client,checkpointKeys,spawnImpl=nodeSpawn,signalProcess,forceSignalProcess,processGroupAlive:groupAlive=processGroupAlive,verifyPullRequestImpl=verifyPullRequest,resolveProjectImpl=resolveProject,ensureWorktreeImpl=ensureWorktree,stopTimeoutMs=8000,logger=console}){
     this.config=config;this.capabilities=capabilities;this.client=client;this.spawnImpl=spawnImpl;
     this.signalProcess=signalProcess||((child)=>processSignal(child,'SIGTERM'));
     this.forceSignalProcess=forceSignalProcess||((child)=>processSignal(child,'SIGKILL'));
     this.processGroupAlive=groupAlive;
     this.verifyPullRequest=verifyPullRequestImpl;
     this.resolveProject=resolveProjectImpl;this.ensureWorktree=ensureWorktreeImpl;this.closing=false;
-    this.stopTimeoutMs=stopTimeoutMs;this.logger=logger;this.running=new Map();this.taskAttempts=new Map();this.inFlight=new Set();
+    this.stopTimeoutMs=stopTimeoutMs;this.logger=logger;this.checkpointKeys=checkpointKeys;this.running=new Map();this.taskAttempts=new Map();this.inFlight=new Set();this.pending=new Map();
   }
   emit(session,type,message,data){
     if(session.stopping&&type!=='stopped')return Promise.resolve();
@@ -73,23 +80,38 @@ export class AgentRunner {
     this.inFlight.add(request);request.catch(error=>{session.lastEventError=error}).finally(()=>this.inFlight.delete(request));return request;
   }
   async run(job){
-    let session;
+    let session;const state={job,cancelRequested:null,doneResolve:null};state.done=new Promise(resolve=>state.doneResolve=resolve);this.pending.set(job.attemptId,state);
     try{
       this.assertCanLaunch();
       this.validate(job);
       if(this.running.has(job.attemptId))throw new Error('Attempt is already running on this node');
       if(this.taskAttempts.has(job.taskId))throw new Error('Another attempt already writes to this task on this node');
       this.taskAttempts.set(job.taskId,job.attemptId);
-      const project=await this.resolveProject(this.config,job.projectId);this.assertCanLaunch();
+      const project=await this.resolveProject(this.config,job.projectId);this.assertCanLaunch();this.assertNotCancelled(state);
       const invocation=buildInvocation({...job,prompt:makePrompt(job)},{...this.config,capabilities:this.capabilities});
-      const worktree=await this.ensureWorktree(project,job.taskId);this.assertCanLaunch();
+      const remoteCheckpoint=job.checkpoint?.checkpointId?job.checkpoint:undefined;
+      const worktree=await this.ensureWorktree(project,job.taskId,remoteCheckpoint?{mustBeNew:true,allowExistingCheckpoint:true}:undefined);this.assertCanLaunch();this.assertNotCancelled(state);
+      state.worktree=worktree;
+      if(remoteCheckpoint){
+        if(!this.checkpointKeys?.privateKey)throw new Error('Node checkpoint private key is unavailable');
+        const context={taskId:job.taskId,projectId:job.projectId,sourceAttemptId:remoteCheckpoint.sourceAttemptId,targetNodeId:remoteCheckpoint.targetNodeId||job.targetNodeId||this.config.nodeId,transferId:remoteCheckpoint.transferId};
+        if(!worktree.created){if(!await hasCheckpointState(worktree,{context,digest:remoteCheckpoint.digest}))throw new Error('Checkpoint target task already has an unrelated worktree or stale transfer state')}
+        else{
+          const fetched=await this.client.readCheckpoint(remoteCheckpoint.checkpointId,{attemptId:job.attemptId,leaseToken:job.leaseToken});
+          this.assertCanLaunch();this.assertNotCancelled(state);
+          await importCheckpoint(worktree,{envelope:fetched.envelope,privateKey:this.checkpointKeys.privateKey,context,digest:remoteCheckpoint.digest});
+          this.assertCanLaunch();this.assertNotCancelled(state);
+        }
+      }
+      this.assertCanLaunch();this.assertNotCancelled(state);
       invocation.cwd=worktree.path;
       const childEnv=Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith('GIT_')));
       const child=this.spawnImpl(invocation.command,invocation.args,{cwd:invocation.cwd,env:{...childEnv,GIT_TERMINAL_PROMPT:'0',CI:'1'},shell:false,detached:process.platform!=='win32',windowsHide:true,stdio:['ignore','pipe','pipe']});
-      session={job,project,worktree,child,output:'',pendingLine:'',stopping:false,terminalState:'running',eventPromises:[]};
+      session={job,project,worktree,child,output:'',pendingLine:'',stopping:false,terminalState:'running',eventPromises:[],state};
       this.running.set(job.attemptId,session);
       session.closed=new Promise(resolve=>{let ended=false;const finish=x=>{if(!ended){ended=true;resolve(x)}};child.once('error',error=>finish({code:1,error}));child.once('close',(code,signal)=>finish({code,signal}))});
       child.stdout?.on('data',bytes=>this.readOutput(session,bytes));child.stderr?.on('data',bytes=>this.readOutput(session,bytes));
+      if(state.cancelRequested)await this.stop(job.attemptId,job.leaseToken,state.cancelRequested);
       const outcome=await session.closed;this.readOutput(session,Buffer.alloc(0),true);session.exitOutcome=outcome;
       if(session.stopping)throw new Error('Task execution was stopped before completion');
       await this.terminateProcessGroup(child);
@@ -108,15 +130,29 @@ export class AgentRunner {
       }
       const checkpoint=await makeCheckpoint(worktree);
       if(session.stopping)throw new Error('Task execution was stopped before completion');
-      session.terminalState='completed';
+      session.terminalState='completing';
       const prUrl=job.allowPR?await this.verifyPullRequest(worktree):undefined;
-      await this.emit(session,'completed',prUrl?`Pull request created: ${prUrl}`:output.slice(0,8000)||'Task process completed',{branch:checkpoint.branch,summary:output.slice(0,8000),...(prUrl?{prUrl}:{})});
+      if(session.stopping)throw new Error('Task execution was stopped before completion');
+      try{await this.emit(session,'completed',prUrl?`Pull request created: ${prUrl}`:output.slice(0,8000)||'Task process completed',{branch:checkpoint.branch,summary:output.slice(0,8000),...(prUrl?{prUrl}:{})})}
+      catch(error){if(error.status===409&&error.code==='stale_attempt'){session.keepForStop=true;session.terminalState='awaiting_stop'}throw error}
+      session.terminalState='completed';
       return {status:job.allowPR?'awaiting_review':'completed',worktree,checkpoint,summary:output,...(prUrl?{prUrl}:{})};
     }catch(error){
-      const alreadyReported=error.message==='AI tool execution failed'||error.message==='Task execution was stopped before completion'||error.code==='NODE_SHUTTING_DOWN';
+      const alreadyReported=error.message==='AI tool execution failed'||error.message==='Task execution was stopped before completion'||error.code==='NODE_SHUTTING_DOWN'||session?.keepForStop;
       let safeToReport=true;
       if(session&&!session.processGroupStopped){try{await this.terminateProcessGroup(session.child);session.processGroupStopped=true}catch(stopError){safeToReport=false;this.logger.error('unable to verify process-group shutdown',sanitizeOutput(stopError.message))}}
-      if(!alreadyReported&&safeToReport){
+      if(state.cancelRequested&&safeToReport&&session){if(session.stopPromise)await session.stopPromise.catch(()=>{})}
+      else if(state.cancelRequested&&safeToReport){
+        const handoff=state.cancelRequested.handoff;let data;
+        const worktree=session?.worktree||state.worktree;
+        if(state.cancelRequested.reason==='transfer'&&handoff&&worktree){
+          const context={taskId:job.taskId,projectId:job.projectId,sourceAttemptId:job.attemptId,targetNodeId:handoff.targetNodeId,transferId:handoff.transferId};
+          const exported=await exportCheckpoint(worktree,{targetPublicKey:handoff.targetPublicKey,context});
+          const uploaded=await this.client.uploadCheckpoint({attemptId:job.attemptId,leaseToken:job.leaseToken,transferId:handoff.transferId,envelope:exported.envelope});
+          const local=await makeCheckpoint(worktree);data={checkpointId:uploaded.checkpointId,digest:uploaded.digest,head:exported.head,branch:local.branch,dirty:local.dirty,transferId:handoff.transferId};
+        }
+        await this.client.event({attemptId:job.attemptId,leaseToken:job.leaseToken,type:'stopped',message:'Attempt stopped before execution; cancellation acknowledged',data:{reason:state.cancelRequested.reason,...(data?{checkpoint:data}:{})}}).catch(()=>{});
+      } else if(!alreadyReported&&safeToReport){
         if(session)await this.emit(session,'failed',error.message).catch(()=>{});
         else await this.client.event({attemptId:job?.attemptId,leaseToken:job?.leaseToken,type:'failed',message:sanitizeOutput(error.message)}).catch(()=>{});
       }
@@ -125,19 +161,33 @@ export class AgentRunner {
       if(session){
         await Promise.allSettled(session.eventPromises);
         if(session.lastEventError)this.logger.error('node event delivery failed',sanitizeOutput(session.lastEventError.message));
-        if(session.processGroupStopped){this.running.delete(session.job.attemptId);if(this.taskAttempts.get(session.job.taskId)===session.job.attemptId)this.taskAttempts.delete(session.job.taskId)}
+        state.runSettled=true;
+        if(session.processGroupStopped&&!session.keepForStop){this.running.delete(session.job.attemptId);if(this.taskAttempts.get(session.job.taskId)===session.job.attemptId)this.taskAttempts.delete(session.job.taskId)}
       } else if(this.taskAttempts.get(job?.taskId)===job?.attemptId)this.taskAttempts.delete(job.taskId);
+      if(!session?.keepForStop)this.pending.delete(job.attemptId);state.doneResolve();
     }
   }
   validate(job){
     for(const key of ['attemptId','leaseToken','taskId','projectId','connectionId','model','mode','title','description'])
       if(typeof job?.[key]!=='string'||!job[key].trim()||job[key].length>20000)throw new Error('Invalid '+key+' in worker job');
     if(!['plan','execute'].includes(job.kind))throw new Error('Invalid worker job kind');
-    if(job.kind==='execute'&&(!job.plan||!Array.isArray(job.plan.steps)||job.plan.steps.length<1||job.plan.steps.length>12))throw new Error('Execution job lacks a valid approved plan');
+    const validSteps=plan=>plan&&Array.isArray(plan.steps)&&plan.steps.length>=1&&plan.steps.length<=12&&plan.steps.every(step=>typeof step?.title==='string'&&typeof step?.acceptance==='string');
+    if(job.kind==='execute'&&!validSteps(job.plan)&&!validSteps(job.parentPlan))throw new Error('Execution job lacks a valid approved plan');
     if(typeof job.allowPush!=='boolean'||typeof job.allowPR!=='boolean'||job.allowPR&&!job.allowPush)throw new Error('Invalid delivery authorization in worker job');
     if(!['codex','cursor'].includes(job.tool)||!this.config[job.tool]||!this.capabilities?.tools?.[job.tool]?.models?.length)throw new Error('Tool is not available on this node');
   }
   assertCanLaunch(){if(this.closing){const error=new Error('Node is shutting down; refusing to launch task');error.code='NODE_SHUTTING_DOWN';throw error}}
+  assertNotCancelled(state){if(state.cancelRequested){const error=new Error('Task attempt was cancelled before process launch');error.code='TASK_CANCELLED';throw error}}
+  async cancel(cancellation){
+    const state=this.pending.get(cancellation.attemptId);if(!state)return false;
+    if(cancellation.leaseToken&&state.job.leaseToken!==cancellation.leaseToken)throw new Error('Stop request lease does not match the active attempt');
+    if(!['pause','cancel','transfer'].includes(cancellation.reason))throw new Error('Invalid cancellation reason');
+    if(state.cancelRequested){if(state.cancelRequested.reason!==cancellation.reason)throw new Error('A different stop intent is already being processed');const current=this.running.get(cancellation.attemptId);if(current)return this.stop(cancellation.attemptId,cancellation.leaseToken,state.cancelRequested);await state.done;return true}
+    state.cancelRequested=cancellation;
+    const session=this.running.get(cancellation.attemptId);
+    if(session)return this.stop(cancellation.attemptId,cancellation.leaseToken,cancellation);
+    await state.done;return true;
+  }
   async shutdown(){this.closing=true;const results=await Promise.allSettled([...this.running.keys()].map(id=>this.stop(id)));for(const result of results)if(result.status==='rejected')this.logger.error('shutdown stop failed',sanitizeOutput(result.reason?.message));return results}
   readOutput(session,bytes,flush=false){
     if(session.output.length>=OUTPUT_LIMIT)return;
@@ -158,7 +208,7 @@ export class AgentRunner {
     const results=[];for(const line of output.split('\n').filter(Boolean)){try{const value=finalTextOf(JSON.parse(line));if(value)results.push(value)}catch{}}
     return sanitizeOutput(results.at(-1)||output.slice(-8000)).trim();
   }
-  async stop(attemptId,leaseToken){
+  async stop(attemptId,leaseToken,cancellation){
     const session=this.running.get(attemptId);
     if(!session)throw new Error('No active tool attempt exists on this node');
     if(leaseToken!==undefined&&session.job.leaseToken!==leaseToken)throw new Error('Stop request lease does not match the active attempt');
@@ -174,9 +224,16 @@ export class AgentRunner {
       if(!closed)throw new Error('Unable to verify the tool process exited; refusing stopped acknowledgment');
       await session.closed;this.readOutput(session,Buffer.alloc(0),true);
       await Promise.allSettled([...this.inFlight,...session.eventPromises]);
-      const checkpoint=await makeCheckpoint(session.worktree);
-      await this.client.event({attemptId,leaseToken:session.job.leaseToken,type:'stopped',message:'Source process stopped; worktree checkpoint recorded',data:{checkpoint}});
+      let checkpoint;
+      if(cancellation?.reason==='transfer'&&cancellation.handoff){
+        const handoff=cancellation.handoff,context={taskId:session.job.taskId,projectId:session.job.projectId,sourceAttemptId:attemptId,targetNodeId:handoff.targetNodeId,transferId:handoff.transferId};
+        const exported=await exportCheckpoint(session.worktree,{targetPublicKey:handoff.targetPublicKey,context});
+        const uploaded=await this.client.uploadCheckpoint({attemptId,leaseToken:session.job.leaseToken,transferId:handoff.transferId,envelope:exported.envelope});
+        const local=await makeCheckpoint(session.worktree);checkpoint={checkpointId:uploaded.checkpointId,digest:uploaded.digest,head:exported.head,branch:local.branch,dirty:local.dirty,transferId:handoff.transferId};
+      }else checkpoint=await makeCheckpoint(session.worktree);
+      await this.client.event({attemptId,leaseToken:session.job.leaseToken,type:'stopped',message:'Source process stopped; worktree checkpoint recorded',data:{reason:cancellation?.reason||'cancel',...(checkpoint?{checkpoint}:{}),...(cancellation?.handoff?.transferId?{transferId:cancellation.handoff.transferId}:{})}});
       session.terminalState='stopped';
+      if(session.state.runSettled){this.running.delete(attemptId);this.pending.delete(attemptId);if(this.taskAttempts.get(session.job.taskId)===attemptId)this.taskAttempts.delete(session.job.taskId)}
       return {stopped:true,checkpoint};
     })().catch(error=>{session.stopPromise=null;throw error});
     return session.stopPromise;
