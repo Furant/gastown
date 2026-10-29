@@ -4,7 +4,22 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { journalDirectory,writeJournal,recoverJournals,readJournal,acquireNodeLock,identifyProcess } from '../journal.mjs';
+import { journalDirectory,nodeJournalNamespace,writeJournal,recoverJournals,readJournal,acquireNodeLock,identifyProcess } from '../journal.mjs';
+
+test('node journal namespace remains stable across discovered heartbeat identity and keeps explicit legacy IDs',async t=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'node-journal-namespace-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+  const config={configPath:path.join(root,'node.json'),worktreesDir:path.join(root,'trees')},namespace=nodeJournalNamespace(config),runtime={...config,journalNamespace:namespace,nodeId:'server-assigned-node'};
+  assert.equal(journalDirectory(runtime),journalDirectory(config));
+  assert.equal(journalDirectory({...config,nodeId:'configured-node'}),path.join(root,'.gastown-node-journals','configured-node'));
+  const release=await acquireNodeLock(config);assert.equal(await fs.stat(path.join(journalDirectory(runtime),'worker.lock')).then(()=>true),true);await release();
+});
+
+test('legacy unscoped journals are warned about and never recovered for an unknown node',async t=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'node-journal-legacy-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+  const config={configPath:path.join(root,'node.json')},legacy=path.join(root,'.gastown-node-journals','node');await fs.mkdir(legacy,{recursive:true});await fs.writeFile(path.join(legacy,'old-attempt.json'),JSON.stringify({phase:'running',attemptId:'old-attempt'}),{mode:0o600});
+  const logs=[],reports=[];await recoverJournals(config,{recover:async body=>reports.push(body)},{error:message=>logs.push(message)});
+  assert.equal(reports.length,0);assert.equal(logs.some(message=>message.includes('left untouched')),true);assert.equal(await fs.readFile(path.join(legacy,'old-attempt.json'),'utf8'),JSON.stringify({phase:'running',attemptId:'old-attempt'}));
+});
 
 test('journals are private and recovery never signals a PID whose start identity differs',async t=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'node-journal-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));

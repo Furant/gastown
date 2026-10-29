@@ -1,14 +1,15 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync=promisify(execFile);
 const writeQueues=new Map();
 const safeId=value=>String(value).replace(/[^A-Za-z0-9_-]/g,'_').slice(0,120);
-export function journalDirectory(config){return path.join(path.dirname(config.configPath||config.worktreesDir),'.gastown-node-journals',safeId(config.nodeId||'node'))}
+export function nodeJournalNamespace(config){if(config.journalNamespace)return safeId(config.journalNamespace);if(config.nodeId)return safeId(config.nodeId);const stablePath=config.configPath||config.worktreesDir;return stablePath?`config-${createHash('sha256').update(path.resolve(stablePath)).digest('hex').slice(0,24)}`:'node'}
+export function journalDirectory(config){return path.join(path.dirname(config.configPath||config.worktreesDir),'.gastown-node-journals',nodeJournalNamespace(config))}
 export async function writeJournal(config,record,{fsImpl=fs}={}){
   const dir=journalDirectory(config),target=path.join(dir,safeId(record.attemptId)+'.json'),serialized=JSON.stringify(record);
   const prior=writeQueues.get(target)||Promise.resolve();
@@ -35,6 +36,11 @@ export async function acquireNodeLock(config){
   throw new Error('Could not acquire node worker lock');
 }
 export async function recoverJournals(config,client,logger=console){
+  if(!config.nodeId&&nodeJournalNamespace(config)!=='node'){
+    const legacy=path.join(path.dirname(config.configPath||config.worktreesDir),'.gastown-node-journals','node');
+    const legacyRecords=await fs.readdir(legacy).catch(()=>[]);
+    if(legacyRecords.some(name=>name.endsWith('.json')))logger.error('unscoped legacy journals detected; left untouched because their owning node cannot be verified');
+  }
   const records=await unresolvedJournals(config);const activeTasks=new Set();
   for(const record of records){
     let outcome='unknown',message='Node restarted while this attempt was unresolved';

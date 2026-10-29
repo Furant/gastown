@@ -42,11 +42,44 @@ export function buildNodeConfig({ serverUrl, projects, cliPaths }) {
   };
 }
 
+export function nodeProjectIds(values) {
+  return Array.isArray(values?.projectIds) ? [...values.projectIds] : [];
+}
+
+export function nodePairCommand() {
+  return 'npm run node -- --config "$PWD/node-config.json" --pair';
+}
+
+export function freshWorkspaceState(previousState) {
+  const deviceSecret = typeof previousState === 'object' ? previousState?.deviceSecret : previousState;
+  return {
+    page: 'tasks', user: null, csrf: '', deviceSecret,
+    items: { projects: [], tasks: [], connections: [], nodes: [], members: [], teams: [], audit: [] },
+    capabilities: null, detail: null, busy: false, filter: 'all', search: '', modal: null,
+    bootstrap: false, tab: 'all', toolFilter: 'all', selected: new Set(), detailTab: 'plan',
+    transferIds: [], nodeSetup: null, selectedNode: null, pairingCode: null, usageProject: null,
+    usageData: null, budgetProject: null, budgetData: null, localProjectDraft: null,
+  };
+}
+
+export function createSessionEpochGuard() {
+  let epoch = 0;
+  return {
+    capture: () => epoch,
+    advance: () => ++epoch,
+    assertCurrent(requestEpoch) {
+      if (requestEpoch !== epoch) throw new Error('会话已切换，请重试。');
+    },
+  };
+}
+
 export function validateNodeConfig(config) {
   const errors = [];
   if (!isControlPlaneUrlAllowed(config?.serverUrl)) errors.push('serverUrl');
-  const projects = Object.values(config?.projects || {});
-  if (!projects.length || projects.some(project => !isAbsoluteNodePath(project.repoPath) || !project.baseBranch?.trim())) errors.push('projects');
+  const projectMap = config?.projects;
+  const validProjectMap = !!projectMap && typeof projectMap === 'object' && !Array.isArray(projectMap);
+  const projects = validProjectMap ? Object.values(projectMap) : [];
+  if (!validProjectMap || projects.some(project => !project || typeof project !== 'object' || Array.isArray(project) || !isAbsoluteNodePath(project.repoPath) || typeof project.baseBranch !== 'string' || !project.baseBranch.trim())) errors.push('projects');
   const tools = Object.values(config?.tools || {});
   if (!tools.length || tools.some(tool => !isAbsoluteNodePath(tool.command))) errors.push('tools');
   return { valid: errors.length === 0, errors };

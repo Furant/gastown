@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { startNode, parseArgs, checkNode, pairNode } from '../index.mjs';
-import { acquireNodeLock, writeJournal } from '../journal.mjs';
+import { acquireNodeLock, journalDirectory, writeJournal } from '../journal.mjs';
 
 test('node sends zero capacity while a leased task occupies its only slot',async()=>{
   const signalSource=new EventEmitter(),capacities=[],job={attemptId:'attempt-1',taskId:'task-1',leaseToken:'lease'};let finish;
@@ -53,6 +53,30 @@ test('node preflight checks local setup and authenticates without polling for wo
   let heartbeats=0,polls=0;const client={heartbeat:async()=>{heartbeats++},poll:async()=>{polls++}};const logs=[];
   await checkNode({serverUrl:'http://localhost:8768',projects:{p:{repoPath:repo,baseBranch:base}},tools:{codex:{command:process.execPath}},worktreesDir:home},{client,capabilities:{tools:[{tool:'codex',models:[{id:'fixture'}]}]},logger:{log:line=>logs.push(line)}});
   assert.equal(heartbeats,1);assert.equal(polls,0);assert.ok(logs.some(line=>line.includes('Server authentication: OK')));
+});
+
+test('preflight accepts frozen loaded config and preserves the caller after heartbeat',async()=>{
+  const config=Object.freeze({serverUrl:'http://localhost:8768',projects:{},tools:{codex:{command:process.execPath}},worktreesDir:'/tmp/node-freeze-test'});let seen;
+  await checkNode(config,{client:{heartbeat:async()=>({node:{id:'server-node'}})},capabilities:{tools:[{tool:'codex',models:[{id:'fixture'}]}]},logger:{log(){}}});
+  assert.equal(config.nodeId,undefined);assert.equal(Object.isFrozen(config),true);
+});
+
+test('worker startup copies heartbeat node identity into runner config without mutating frozen caller',async()=>{
+  const config=Object.freeze({projects:{},tools:{},maxConcurrent:1,pollIntervalMs:1});let runnerConfig;
+  const runner={running:new Map(),shutdown:async()=>{}};
+  await startNode(config,{once:true,client:{heartbeat:async()=>({node:{id:'server-node'}}),poll:async()=>({jobs:[],cancellations:[]})},capabilities:{tools:[]},runnerFactory:options=>{runnerConfig=options.config;runner.config=options.config;return runner},signalSource:new EventEmitter(),logger:{error(){}}});
+  assert.equal(config.nodeId,undefined);assert.equal(runner.config.nodeId,'server-node');assert.notEqual(runnerConfig,config);
+});
+
+test('a running journal written after heartbeat is recovered on restart without configured nodeId',async t=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'town-startup-journal-')),configPath=path.join(root,'node.json');t.after(()=>fs.rm(root,{recursive:true,force:true}));
+  const config=Object.freeze({configPath,projects:{},tools:{},worktreesDir:path.join(root,'trees'),maxConcurrent:1,pollIntervalMs:1}),job={attemptId:'attempt-after-heartbeat',taskId:'task-after-heartbeat',leaseToken:'lease'};let polls=0;const recovered=[];
+  const client={heartbeat:async()=>({node:{id:'server-assigned-node'}}),poll:async()=>({jobs:polls++===0?[job]:[],cancellations:[]}),recover:async body=>recovered.push(body)};
+  const firstRunner={running:new Map(),async run(activeJob){await writeJournal(this.config,{attemptId:activeJob.attemptId,taskId:activeJob.taskId,leaseToken:activeJob.leaseToken,phase:'running'})},async shutdown(){}};
+  await startNode(config,{once:true,client,capabilities:{tools:[]},runnerFactory:({config:runtime})=>{firstRunner.config=runtime;return firstRunner},signalSource:new EventEmitter(),logger:{error(){}}});
+  assert.equal(journalDirectory(firstRunner.config),journalDirectory(config));assert.ok(await fs.stat(path.join(journalDirectory(config),'attempt-after-heartbeat.json')));
+  await startNode(config,{once:true,client,capabilities:{tools:[]},runnerFactory:()=>({running:new Map(),async shutdown(){}}),signalSource:new EventEmitter(),logger:{error(){}}});
+  assert.equal(recovered.length,1);assert.equal(recovered[0].attemptId,job.attemptId);assert.equal(recovered[0].outcome,'unknown');
 });
 
 test('restart recovery runs under the node lock before tool discovery can fail',async t=>{

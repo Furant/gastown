@@ -7,7 +7,7 @@ import fs from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { resolveProject } from './workspace.mjs';
 import { ensureNodeCheckpointKeys } from './checkpoint.mjs';
-import { recoverJournals, acquireNodeLock } from './journal.mjs';
+import { recoverJournals, acquireNodeLock, nodeJournalNamespace } from './journal.mjs';
 import { parseMappings, syncNodeConfig } from './config-sync.mjs';
 
 export function parseArgs(args){let configPath,once=false,check=false,pair=false,syncConfig=false;const maps=[];for(let i=0;i<args.length;i++){if(args[i]==='--help'||args[i]==='-h')return{help:true};if(args[i]==='--config')configPath=args[++i];else if(args[i]==='--once')once=true;else if(args[i]==='--check')check=true;else if(args[i]==='--pair')pair=true;else if(args[i]==='--sync-config')syncConfig=true;else if(args[i]==='--map')maps.push(args[++i]||'');else throw new Error(`Unknown argument: ${args[i]}`)}if(!configPath)throw new Error('Usage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check|--pair|--sync-config]');if(Number(once)+Number(check)+Number(pair)+Number(syncConfig)>1)throw new Error('--sync-config, --pair, --once and --check cannot be combined');if(maps.length&&!syncConfig)throw new Error('--map requires --sync-config');return{configPath,once,check,...(pair?{pair:true}:{}),...(syncConfig?{syncConfig:true,maps:parseMappings(maps)}:{})}}
@@ -38,12 +38,13 @@ export async function checkNode(config,{client=new WorkerClient(config),capabili
   for(const [tool,entry] of configured){const executable=await fs.realpath(entry.command).catch(()=>{throw new Error(`${tool} executable does not exist: ${entry.command}`)});await fs.access(executable,fsConstants.X_OK).catch(()=>{throw new Error(`${tool} executable is not runnable: ${executable}`)})}
   const views=capabilityViews(capabilities||await discoverCapabilities(config));
   for(const [tool] of configured)if(!views.runner.tools[tool]?.models?.length)throw new Error(`${tool} CLI is present, but no supported signed-in models were discovered`);
-  const heartbeat=await client.heartbeat(views.reported,checkpointKeys.publicKey);if(heartbeat?.node?.id)config.nodeId=heartbeat.node.id;
+  await client.heartbeat(views.reported,checkpointKeys.publicKey);
   logger.log(`Server authentication: OK (${config.serverUrl})`);for(const project of projects)logger.log(`Project ${project.id}: OK (${project.path}, ${project.baseBranch})`);for(const [tool] of configured)logger.log(`${tool}: OK (${views.runner.tools[tool].models.length} supported models)`);
   return {serverUrl:config.serverUrl,projects,tools:views.runner.tools};
 }
 export async function startNode(config,{once=false,client:providedClient,capabilities:providedCapabilities,logger=console,signalSource=process,runnerFactory=options=>new AgentRunner(options),discoverCapabilitiesImpl=discoverCapabilities}={}){
   const client=providedClient||new WorkerClient(config);
+  let runtimeConfig={...config,journalNamespace:nodeJournalNamespace(config)};
   const releaseNodeLock=config.configPath?await acquireNodeLock(config):async()=>{};
   let checkpointKeys,views,runner;
   const active=new Map();let stopping=false;
@@ -60,11 +61,11 @@ export async function startNode(config,{once=false,client:providedClient,capabil
     if(client.recover)await recoverJournals(config,client,logger);
     checkpointKeys=await ensureNodeCheckpointKeys(config);
     views=capabilityViews(providedCapabilities||await discoverCapabilitiesImpl(config));
-    runner=runnerFactory({config,capabilities:views.runner,client,checkpointKeys,logger});
+    runner=runnerFactory({config:runtimeConfig,capabilities:views.runner,client,checkpointKeys,logger});
     let nextHeartbeat=0,nextCapabilityRefresh=Date.now()+300000;
     do{
       if(Date.now()>=nextCapabilityRefresh){try{const updated=capabilityViews(await discoverCapabilitiesImpl(config));views.reported=updated.reported;views.runner=updated.runner;runner.capabilities=updated.runner}catch(error){logger.error('capability refresh failed',error.message)}nextCapabilityRefresh=Date.now()+300000}
-      if(Date.now()>=nextHeartbeat){nextHeartbeat=Date.now()+15000;try{const heartbeat=await client.heartbeat(views.reported,checkpointKeys.publicKey);if(heartbeat?.node?.id)config.nodeId=heartbeat.node.id;consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}}
+      if(Date.now()>=nextHeartbeat){nextHeartbeat=Date.now()+15000;try{const heartbeat=await client.heartbeat(views.reported,checkpointKeys.publicKey);if(heartbeat?.node?.id){runtimeConfig={...runtimeConfig,nodeId:heartbeat.node.id};if(runner)runner.config=runtimeConfig}consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}}
       const capacity=once?config.maxConcurrent:Math.max(0,config.maxConcurrent-Math.max(active.size,runner.running.size));
       let result;try{result=await client.poll({capacity});consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}
       for(const cancellation of result.cancellations||[]){

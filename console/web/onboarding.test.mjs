@@ -11,6 +11,10 @@ import {
   isControlPlaneUrlAllowed,
   nodeStatus,
   validateNodeConfig,
+  nodeProjectIds,
+  freshWorkspaceState,
+  nodePairCommand,
+  createSessionEpochGuard,
 } from './onboarding.mjs';
 
 test('builds a token-free node config from mapped projects and CLI paths', () => {
@@ -27,6 +31,56 @@ test('builds a token-free node config from mapped projects and CLI paths', () =>
   });
   assert.equal(JSON.stringify(config).includes(excludedToken), false);
   assert.equal(validateNodeConfig(config).valid, true);
+});
+
+test('accepts an empty project map for first-node bootstrap but validates every supplied mapping', () => {
+  const bootstrap = { serverUrl: 'https://console.example.com', projects: {}, tools: { codex: { command: '/usr/local/bin/codex' } } };
+  assert.equal(validateNodeConfig(bootstrap).valid, true);
+  assert.equal(validateNodeConfig({ ...bootstrap, projects: { p: { repoPath: 'relative', baseBranch: 'main' } } }).errors.includes('projects'), true);
+  assert.equal(validateNodeConfig({ ...bootstrap, projects: { p: { repoPath: '/work/repo', baseBranch: '' } } }).errors.includes('projects'), true);
+  for (const projects of [undefined, null, [], { p: null }, { p: [] }]) {
+    const config = { ...bootstrap, projects };
+    if (projects === undefined) delete config.projects;
+    assert.equal(validateNodeConfig(config).errors.includes('projects'), true, `rejects ${String(projects)}`);
+  }
+});
+
+test('normalizes node registration with no project checkbox controls to an empty project list', () => {
+  assert.deepEqual(nodeProjectIds({ name: 'My laptop' }), []);
+  assert.deepEqual(nodeProjectIds({ projectIds: ['project-1'] }), ['project-1']);
+});
+
+test('fresh workspace reset discards account-private state and retains only local device credential', () => {
+  const secret = 'a'.repeat(64);
+  const fresh = freshWorkspaceState({
+    page: 'detail', detail: { diff: 'private account diff' },
+    localProjectDraft: { localPath: '/private/repo' }, token: excludedToken,
+    nodeSetup: { values: { cliPaths: { codex: '/private/codex' } } }, pairingCode: { code: 'private-code' },
+    items: { projects: [{ localPath: '/private/repo' }] }, deviceSecret: secret,
+  });
+  assert.equal(fresh.deviceSecret, secret);
+  assert.equal(fresh.user, null);
+  assert.equal(fresh.detail, null);
+  assert.equal(fresh.page, 'tasks');
+  assert.equal(fresh.nodeSetup, null);
+  assert.equal(fresh.pairingCode, null);
+  assert.equal(fresh.localProjectDraft, null);
+  assert.deepEqual(fresh.items, { projects: [], tasks: [], connections: [], nodes: [], members: [], teams: [], audit: [] });
+});
+
+test('pairing command prompts for the code instead of exposing it in argv', () => {
+  const command = nodePairCommand();
+  assert.match(command, /--pair$/);
+  assert.equal(command.includes('CODE'), false);
+});
+
+test('session epoch guard rejects responses started before account state reset', () => {
+  const guard = createSessionEpochGuard();
+  const requestEpoch = guard.capture();
+  guard.assertCurrent(requestEpoch);
+  guard.advance();
+  assert.throws(() => guard.assertCurrent(requestEpoch), /会话已切换/);
+  assert.equal(guard.capture(), requestEpoch + 1);
 });
 
 test('allows HTTPS control planes and loopback HTTP only', () => {
