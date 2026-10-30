@@ -46,8 +46,52 @@ export function nodeProjectIds(values) {
   return Array.isArray(values?.projectIds) ? [...values.projectIds] : [];
 }
 
-export function nodePairCommand() {
-  return 'npm run node -- --config "$PWD/node-config.json" --pair';
+export function renderAllowedModelChoices(models, allowedModels) {
+  return models.map(model => {
+    const selected = !allowedModels?.length || allowedModels.includes(model.id);
+    return `<label class="check"><input type="checkbox" name="allowedModels" value="${escapeHTML(model.id)}" ${selected ? 'checked' : ''}>允许任务使用 ${escapeHTML(model.name)}</label>`;
+  }).join('');
+}
+
+export function shellQuoteNodePath(value) {
+  if (typeof value !== 'string' || !value || value !== value.trim() || /[\0\r\n]/.test(value) || !isAbsoluteNodePath(value)) throw new Error('请填写不含换行的绝对路径。');
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+export function buildNodeCommand({ consoleDir, configPath, mode = 'start' } = {}) {
+  const modes = { pair: '--pair', check: '--check', 'sync-config': '--sync-config', start: '' };
+  if (!Object.hasOwn(modes, mode)) throw new Error('不支持的节点命令模式。');
+  return `npm --prefix ${shellQuoteNodePath(consoleDir)} run node -- --config ${shellQuoteNodePath(configPath)}${modes[mode] ? ` ${modes[mode]}` : ''}`;
+}
+
+export function buildNodeSetupCommand({ consoleDir, configPath, mode = 'start' } = {}) {
+  const config = shellQuoteNodePath(configPath);
+  const command = buildNodeCommand({ consoleDir, configPath, mode });
+  const secureToken = `if [ -z "\${GAS_TOWN_NODE_TOKEN:-}" ]; then printf '%s' 'GAS_TOWN_NODE_TOKEN: '; IFS= read -r -s GAS_TOWN_NODE_TOKEN; printf '\\n'; fi; export GAS_TOWN_NODE_TOKEN; `;
+  return `(\nset -e\nif [ ! -f ${config} ]; then printf '%s\\n' 'node-config.json was not found at the configured path.' >&2; exit 1; fi\nchmod 600 ${config}\n${secureToken}${command}\n)`;
+}
+
+export function validNodeCommandPaths(paths) {
+  try { shellQuoteNodePath(paths?.consoleDir); shellQuoteNodePath(paths?.configPath); return true; }
+  catch { return false; }
+}
+
+export function nodePathPreferenceKey(ownerId, nodeId) {
+  if (!ownerId || !nodeId) return '';
+  return `gastown.node-paths.v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(nodeId)}`;
+}
+
+export function readNodePathPreferences(storage, ownerId, nodeId) {
+  const key = nodePathPreferenceKey(ownerId, nodeId);
+  try { const value = key ? JSON.parse(storage?.getItem(key) || '{}') : {}; return { consoleDir: value.consoleDir || '', configPath: value.configPath || '' }; }
+  catch { return { consoleDir: '', configPath: '' }; }
+}
+
+export function saveNodePathPreferences(storage, ownerId, nodeId, paths) {
+  const key = nodePathPreferenceKey(ownerId, nodeId);
+  if (!key) return false;
+  try { storage?.setItem(key, JSON.stringify({ consoleDir: paths?.consoleDir || '', configPath: paths?.configPath || '' })); return true; }
+  catch { return false; }
 }
 
 export function freshWorkspaceState(previousState) {

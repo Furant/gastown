@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildNodeConfig,
+  renderAllowedModelChoices,
   escapeHTML,
   getLocalDeviceSecret,
   githubPrUrl,
@@ -13,7 +14,12 @@ import {
   validateNodeConfig,
   nodeProjectIds,
   freshWorkspaceState,
-  nodePairCommand,
+  buildNodeCommand,
+  buildNodeSetupCommand,
+  nodePathPreferenceKey,
+  readNodePathPreferences,
+  saveNodePathPreferences,
+  validNodeCommandPaths,
   createSessionEpochGuard,
 } from './onboarding.mjs';
 
@@ -68,10 +74,39 @@ test('fresh workspace reset discards account-private state and retains only loca
   assert.deepEqual(fresh.items, { projects: [], tasks: [], connections: [], nodes: [], members: [], teams: [], audit: [] });
 });
 
-test('pairing command prompts for the code instead of exposing it in argv', () => {
-  const command = nodePairCommand();
-  assert.match(command, /--pair$/);
-  assert.equal(command.includes('CODE'), false);
+test('node commands use quoted explicit paths and never depend on current directory', () => {
+  const paths = { consoleDir: "/Users/me/Gas Town/it's $HOME/$(touch nope)`x`", configPath: "/Users/me/Gas Town/node's config.json" };
+  const pair = buildNodeCommand({ ...paths, mode: 'pair' });
+  assert.equal(pair, "npm --prefix '/Users/me/Gas Town/it'\"'\"'s $HOME/$(touch nope)`x`' run node -- --config '/Users/me/Gas Town/node'\"'\"'s config.json' --pair");
+  assert.equal(pair.includes('$PWD'), false);
+  assert.equal(buildNodeCommand({ ...paths, mode: 'sync-config' }).endsWith('--sync-config'), true);
+  assert.equal(buildNodeCommand(paths).includes('--check'), false);
+  assert.throws(() => buildNodeCommand({ ...paths, configPath: '/tmp/a\nb' }), /绝对路径/);
+  assert.throws(() => buildNodeCommand({ ...paths, consoleDir: '/tmp/a\0b' }), /绝对路径/);
+});
+
+test('setup wrappers enforce config permissions and prompt securely without embedding secrets', () => {
+  const command = buildNodeSetupCommand({ consoleDir: '/opt/gastown', configPath: '/tmp/node config.json', mode: 'check' });
+  assert.match(command, /^\(\nset -e\nif \[ ! -f /);
+  assert.match(command, /chmod 600 '[^']+'/);
+  assert.match(command, /read -r -s/);
+  assert.match(command, /GAS_TOWN_NODE_TOKEN/);
+  assert.match(command, /--check\n\)$/);
+  assert.equal(command.includes('secret'), false);
+  assert.match(buildNodeSetupCommand({ consoleDir: '/opt/gastown', configPath: '/tmp/node.json', mode: 'pair' }), /GAS_TOWN_NODE_TOKEN/);
+  assert.match(buildNodeSetupCommand({ consoleDir: '/opt/gastown', configPath: '/tmp/node.json', mode: 'start' }), /npm --prefix '[^']+' run node/);
+});
+
+test('node paths persist under owner and node scoped non-secret preferences', () => {
+  const memory = new Map();
+  const storage = { getItem: key => memory.get(key), setItem: (key, value) => memory.set(key, value) };
+  saveNodePathPreferences(storage, 'owner-a', 'node-1', { consoleDir: '/work/a', configPath: '/work/a.json' });
+  saveNodePathPreferences(storage, 'owner-b', 'node-1', { consoleDir: '/work/b', configPath: '/work/b.json' });
+  assert.deepEqual(readNodePathPreferences(storage, 'owner-a', 'node-1'), { consoleDir: '/work/a', configPath: '/work/a.json' });
+  assert.notEqual(nodePathPreferenceKey('owner-a', 'node-1'), nodePathPreferenceKey('owner-b', 'node-1'));
+  assert.deepEqual(readNodePathPreferences(storage, 'owner-a', 'node-2'), { consoleDir: '', configPath: '' });
+  assert.equal(validNodeCommandPaths({ consoleDir: 'relative', configPath: '/abs/cfg' }), false);
+  assert.equal(validNodeCommandPaths({ consoleDir: '/abs/with\nnewline', configPath: '/abs/cfg' }), false);
 });
 
 test('session epoch guard rejects responses started before account state reset', () => {
@@ -125,4 +160,10 @@ test('local device credential persists securely generated random bytes and reuse
   assert.equal(getLocalDeviceSecret(storage, { getRandomValues: () => { throw new Error('must reuse'); } }), first);
   values.set('gastown.local-device.v1', 'invalid');
   assert.equal(getLocalDeviceSecret(storage, cryptoApi), first);
+});
+
+test('model authorization HTML preserves checked grants instead of emitting boolean attributes',()=>{
+ const html=renderAllowedModelChoices([{id:'allowed',name:'Allowed'},{id:'denied',name:'<script>Denied</script>'}],['allowed']);
+ assert.match(html,/value="allowed" checked/);assert.doesNotMatch(html,/value="denied" checked/);assert.doesNotMatch(html,/<script>/);assert.match(html,/&lt;script&gt;/);
+ const initial=renderAllowedModelChoices([{id:'default',name:'Default'}]);assert.match(initial,/value="default" checked/);
 });

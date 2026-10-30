@@ -482,6 +482,7 @@ test('local Git projects require a paired private node and browser device, and s
   assert.equal(JSON.stringify(listed.json).includes('localDeviceHash'),false);
   const local = await req(f,'/api/v1/projects',{method:'POST',...auth,device,body:{name:'Local repo',repoType:'local',localPath:'/Users/owner/src/repo',localNodeId:node.json.data.id,baseBranch:'main',visibility:'private'}});
   assert.equal(local.status,201,JSON.stringify(local.json));
+  const localGrantRemoval=await req(f,`/api/v1/nodes/${node.json.data.id}`,{method:'PATCH',...auth,device,body:{projectIds:[]}});assert.equal(localGrantRemoval.status,400);
   assert.deepEqual({repoType:local.json.data.repoType,localPath:local.json.data.localPath,localNodeId:local.json.data.localNodeId,visibility:local.json.data.visibility},{repoType:'local',localPath:'/Users/owner/src/repo',localNodeId:node.json.data.id,visibility:'private'});
   const grants = (await f.db.query('SELECT project_ids FROM nodes WHERE id=$1',[node.json.data.id])).rows[0].project_ids;
   assert.ok((Array.isArray(grants)?grants:JSON.parse(grants)).includes(local.json.data.id),'local project binding grants the chosen node access');
@@ -547,4 +548,42 @@ test('workflow review requires child acceptance, blocks stale downstream rework,
  const rerun=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:2}})).json.data.jobs[0];assert.equal(rerun.taskId,childB.id);await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:rerun.attemptId,leaseToken:rerun.leaseToken,type:'completed',data:{branch:'b-fixed'}}});
  await req(x.f,`/api/v1/tasks/${childB.id}/review`,{method:'POST',...x.auth,body:{decision:'accept',expectedGeneration:1}});
  const parentAccepted=await req(x.f,`/api/v1/tasks/${parentId}/review`,{method:'POST',...x.auth,body:{decision:'accept',expectedGeneration:0}});assert.equal(parentAccepted.json.data?.status,'completed',JSON.stringify(parentAccepted.json));
+});
+
+test('node edit changes project grants and sharing without rotating credentials',async t=>{
+ const x=await ownerFixture(t),node=(await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie})).json.data[0];
+ const second=await req(x.f,'/api/v1/projects',{method:'POST',...x.auth,body:{name:'Second repo',repoUrl:'https://github.com/team/second.git',baseBranch:'main',visibility:'private'}});assert.equal(second.status,201);
+ const before=(await x.f.db.query('SELECT token_hash,project_ids FROM nodes WHERE id=$1',[node.id])).rows[0];
+ const edited=await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{name:'Updated runner',projectIds:[x.project,second.json.data.id]}});assert.equal(edited.status,200,JSON.stringify(edited.json));assert.equal(edited.json.data.name,'Updated runner');assert.deepEqual(edited.json.data.projectIds,[x.project,second.json.data.id]);
+ const after=(await x.f.db.query('SELECT token_hash FROM nodes WHERE id=$1',[node.id])).rows[0];assert.equal(after.token_hash,before.token_hash);assert.equal(JSON.stringify(edited.json).includes(x.token),false);
+ const omitted=await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{name:'Still same grants'}});assert.equal(omitted.status,200);assert.deepEqual(omitted.json.data.projectIds,[x.project,second.json.data.id]);
+ assert.equal((await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{ownerId:'other'}})).status,400);
+ assert.equal((await req(x.f,'/api/v1/nodes/not-in-this-org',{method:'PATCH',...x.auth,body:{name:'Nope'}})).status,404);
+ const member=await req(x.f,'/api/v1/members',{method:'POST',...x.auth,body:{name:'No edit',email:'node-edit@example.test',password:fixturePassword('node-edit-member-password')}}),login=await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:'node-edit@example.test',password:fixturePassword('node-edit-member-password')}}),memberAuth={cookie:login.headers.get('set-cookie').split(';')[0],csrf:login.json.data.csrfToken};
+ assert.equal((await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...memberAuth,body:{name:'Impersonate'}})).status,403);
+});
+
+test('node grant revocation stops active work and cancels queued work until safe stop acknowledgment',async t=>{
+ const x=await ownerFixture(t),node=(await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie})).json.data[0];
+ const first=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Active task',description:'Stop safely',projectId:x.project,connectionId:x.source}}),second=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Queued task',description:'Cancel cleanly',projectId:x.project,connectionId:x.source}});
+ const active=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:1}})).json.data.jobs[0];
+ const edited=await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{projectIds:[]}});assert.equal(edited.status,200,JSON.stringify(edited.json));
+ assert.equal((await req(x.f,`/api/v1/tasks/${first.json.data.id}`,{cookie:x.auth.cookie})).json.data.status,'stopping');assert.equal((await req(x.f,`/api/v1/tasks/${second.json.data.id}`,{cookie:x.auth.cookie})).json.data.status,'canceled');
+ const queuedEvent=(await req(x.f,`/api/v1/tasks/${second.json.data.id}`,{cookie:x.auth.cookie})).json.data.events.find(e=>e.type==='node_access_revoked');assert.ok(queuedEvent);
+ const cancellation=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:0}})).json.data.cancellations[0];assert.equal(cancellation.taskId,first.json.data.id);
+ const ack=await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:active.attemptId,leaseToken:active.leaseToken,type:'stopped',data:{}}});assert.equal(ack.status,200,JSON.stringify(ack.json));assert.equal((await req(x.f,`/api/v1/tasks/${first.json.data.id}`,{cookie:x.auth.cookie})).json.data.status,'canceled');
+});
+
+test('connection edits add a second node project and refuse invalid or in-use grant removal',async t=>{
+ const x=await ownerFixture(t),nodes=(await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie})).json.data,node=nodes[0];
+ const second=(await req(x.f,'/api/v1/projects',{method:'POST',...x.auth,body:{name:'Additional connection repo',repoUrl:'https://github.com/team/additional.git',baseBranch:'main',visibility:'private'}})).json.data;
+ const initial=await req(x.f,`/api/v1/connections/${x.source}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project,second.id]}});assert.equal(initial.status,400,'node grant is required before connection grant');
+ assert.equal((await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project,second.id]}})).status,200);
+ const edited=await req(x.f,`/api/v1/connections/${x.source}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project,second.id]}});assert.equal(edited.status,200,JSON.stringify(edited.json));assert.deepEqual(edited.json.data.projectIds,[x.project,second.id]);
+ const queued=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Second repo task',description:'Verify the existing connection can run another project',projectId:second.id,connectionId:x.source}});assert.equal(queued.status,201,JSON.stringify(queued.json));
+ const denied=await req(x.f,`/api/v1/connections/${x.source}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project]}});assert.equal(denied.status,409);assert.equal(denied.json.error.code,'connection_projects_in_use');
+ assert.equal((await req(x.f,`/api/v1/tasks/${queued.json.data.id}/cancel`,{method:'POST',...x.auth,body:{}})).status,200);
+ const removed=await req(x.f,`/api/v1/connections/${x.source}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project]}});assert.equal(removed.status,200);
+ assert.equal((await req(x.f,`/api/v1/connections/${x.source}`,{method:'PATCH',...x.auth,body:{allowedModels:'wrong-type'}})).status,400);
+ assert.equal((await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:null})).status,400);
 });

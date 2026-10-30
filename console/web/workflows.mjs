@@ -90,7 +90,3 @@ export function validateReviewFeedback(value) {
   if (value.trim().length > 4000) return '退回意见不能超过 4000 个字符。';
   return '';
 }
-
-export function nodeConfigSyncCommand() {
-  return 'npm run node -- --config "$PWD/node-config.json" --sync-config';
-}

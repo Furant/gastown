@@ -10,6 +10,7 @@ import { saveCheckpoint, readCheckpoint } from './checkpoints.mjs';
 import { changePassword, resetMemberPassword, updateMember, updateTeam } from './member-admin.mjs';
 import { getBudget, getUsage, putBudget, checkBudget, recordUsage } from './usage-budgets.mjs';
 import { recoverAttempt } from './recovery.mjs';
+import { editConnection } from './connection-edit.mjs';
 import { createPairing, confirmPairing, localDeviceHash, requireLocalProjectDevice, requireLocalExecutionNode, validateLocalReview } from './local-projects.mjs';
 
 const MAX_BODY=64*1024,MAX_TEXT=16*1024,COOKIE='gt_session',SESSION_MS=12*60*60*1000,TOOLS=new Set(['codex','cursor']);
@@ -121,6 +122,49 @@ export async function createApp({db,staticDir=resolve(import.meta.dirname,'../we
    if(path==='/api/v1/nodes'&&method==='GET'){
     const {rows}=await db.query('SELECT * FROM nodes WHERE org_id=$1 ORDER BY created_at DESC',[user.org_id]);const teams=await teamsFor(user);return response(res,200,rows.filter(r=>inScope(r,user,teams)).map(n=>publicNode(n,user.local_device_hash)));
    }
+   const nodeEditMatch=path.match(/^\/api\/v1\/nodes\/([^/]+)$/);
+   if(nodeEditMatch&&method==='PATCH'){
+    const b=await body(req),allowedFields=new Set(['name','visibility','teamId','memberIds','projectIds']);if(!b||typeof b!=='object'||Array.isArray(b))invalid('Node changes must be an object');if(Object.keys(b).some(k=>!allowedFields.has(k)))invalid('Only node name, sharing and project grants can be edited');if(!Object.keys(b).length)invalid('Provide at least one node field to update');
+    const before=(await db.query('SELECT * FROM nodes WHERE id=$1 AND org_id=$2',[nodeEditMatch[1],user.org_id])).rows[0];if(!before)missing();if(before.owner_id!==user.id)denied();if(before.revoked_at)fail(409,'node_revoked','Revoked nodes cannot be edited');
+    if(b.name!==undefined&&!one(b.name,160))invalid('Node name is required and must be at most 160 characters');
+    if(b.projectIds!==undefined&&(!Array.isArray(b.projectIds)||b.projectIds.length>100||b.projectIds.some(id=>!one(id,80))||new Set(b.projectIds).size!==b.projectIds.length))invalid('Project grants must be a unique list of at most 100 project IDs');
+    if(b.memberIds!==undefined&&!Array.isArray(b.memberIds))invalid('memberIds must be an array');
+    let updated;
+    await db.transaction(async tx=>{
+     await tx.query('SELECT id FROM orgs WHERE id=$1 FOR UPDATE',[user.org_id]);
+     const actor=(await tx.query('SELECT * FROM users WHERE id=$1 AND org_id=$2 AND disabled_at IS NULL',[user.id,user.org_id])).rows[0];if(!actor)denied();
+     const current=(await tx.query('SELECT * FROM nodes WHERE id=$1 AND org_id=$2 FOR UPDATE',[nodeEditMatch[1],user.org_id])).rows[0];if(!current)missing();if(current.owner_id!==user.id)denied();if(current.revoked_at)fail(409,'node_revoked','Revoked nodes cannot be edited');
+     const teams=new Set((await tx.query('SELECT team_id FROM team_members WHERE user_id=$1',[user.id])).rows.map(r=>r.team_id)),members=new Set((await tx.query('SELECT id FROM users WHERE org_id=$1 AND disabled_at IS NULL',[user.org_id])).rows.map(r=>r.id));
+     const scope=assertScopeInput({visibility:b.visibility??current.visibility,teamId:b.teamId??current.team_id,memberIds:b.memberIds??asArray(current.member_ids)},members,teams);
+     const projectIds=b.projectIds===undefined?asArray(current.project_ids):b.projectIds;
+     const projects=projectIds.length?(await tx.query('SELECT * FROM projects WHERE org_id=$1 AND id=ANY($2::text[])',[user.org_id,projectIds])).rows:[];
+     if(projects.length!==projectIds.length)fail(400,'invalid_project_grant','Every granted project must belong to this organization');
+     for(const project of projects){if(!inScope(project,user,teams))fail(403,'project_not_usable','Every granted project must be available to the node owner');if(project.repo_type==='local'&&(project.visibility!=='private'||project.owner_id!==user.id||project.local_node_id!==current.id||!user.local_device_hash))fail(400,'local_project_binding','Local projects must remain private and bound to this node and its paired owner device');}
+     const localProjects=(await tx.query("SELECT id FROM projects WHERE org_id=$1 AND repo_type='local' AND local_node_id=$2",[user.org_id,current.id])).rows.map(p=>p.id);
+     if(localProjects.some(id=>!projectIds.includes(id)))fail(400,'local_project_binding','A node cannot remove a project bound to its paired local device');
+     const nextNode={...current,name:b.name===undefined?current.name:b.name.trim(),visibility:scope.visibility,team_id:scope.teamId,member_ids:JSON.stringify(scope.memberIds),project_ids:JSON.stringify(projectIds)};
+     await tx.query('UPDATE nodes SET name=$2,visibility=$3,team_id=$4,member_ids=$5::jsonb,project_ids=$6::jsonb WHERE id=$1',[current.id,nextNode.name,nextNode.visibility,nextNode.team_id,JSON.stringify(scope.memberIds),JSON.stringify(projectIds)]);
+     const inFlightStatuses=['planning','running','stopping'];
+     const affected=(await tx.query("SELECT t.*,c.node_id,c.owner_id AS connection_owner_id,c.project_ids AS connection_project_ids,c.visibility AS connection_visibility,c.team_id AS connection_team_id,c.member_ids AS connection_member_ids,p.visibility AS project_visibility,p.team_id AS project_team_id,p.member_ids AS project_member_ids,p.owner_id AS project_owner_id FROM tasks t JOIN connections c ON c.id=t.connection_id JOIN projects p ON p.id=t.project_id WHERE t.org_id=$1 AND c.node_id=$2 AND t.status IN ('planning_queued','planning','awaiting_approval','queued','running','stopping','blocked','paused','quota_blocked')",[user.org_id,current.id])).rows;
+     let cancelledOrStoppingTasks=0;
+     for(const task of affected){
+      const owner=(await tx.query('SELECT * FROM users WHERE id=$1 AND org_id=$2',[task.owner_id,user.org_id])).rows[0];if(!owner)continue;
+      const ownerTeams=new Set((await tx.query('SELECT team_id FROM team_members WHERE user_id=$1',[owner.id])).rows.map(r=>r.team_id));
+      const project={id:task.project_id,org_id:task.org_id,owner_id:task.project_owner_id,visibility:task.project_visibility,team_id:task.project_team_id,member_ids:task.project_member_ids};
+      const connection={node_id:task.node_id,org_id:task.org_id,owner_id:task.connection_owner_id||user.id,visibility:task.connection_visibility,team_id:task.connection_team_id,member_ids:task.connection_member_ids};
+      const stillAllowed=!owner.disabled_at&&projectIds.includes(task.project_id)&&asArray(task.connection_project_ids).includes(task.project_id)&&inScope(project,owner,ownerTeams)&&inScope(connection,owner,ownerTeams)&&inScope(nextNode,owner,ownerTeams);
+      if(stillAllowed)continue;
+      const active=inFlightStatuses.includes(task.status)&&task.current_attempt_id;
+      if(active){await tx.query("UPDATE attempts SET status='stop_requested' WHERE id=$1 AND status IN ('running','stop_requested')",[task.current_attempt_id]);await tx.query("UPDATE tasks SET status='stopping',stop_intent='cancel',updated_at=now() WHERE id=$1",[task.id]);}
+      else await tx.query("UPDATE tasks SET status='canceled',current_attempt_id=NULL,stop_intent=NULL,updated_at=now() WHERE id=$1",[task.id]);
+      cancelledOrStoppingTasks++;await tx.query("INSERT INTO task_events(id,org_id,task_id,attempt_id,type,message,data,actor_id) VALUES($1,$2,$3,$4,'node_access_revoked','Node access changed; task canceled or stopping',$5::jsonb,$6)",[randomUUID(),task.org_id,task.id,active?task.current_attempt_id:null,JSON.stringify({from:task.status,to:active?'stopping':'canceled'}),user.id]);
+      if(!active)await advanceWorkflow(tx,task,'canceled');
+     }
+     await tx.query('INSERT INTO audit(id,org_id,actor_id,action,object_type,object_id,details) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)',[randomUUID(),user.org_id,user.id,'node.updated','node',current.id,JSON.stringify({changedFields:Object.keys(b),projectIdsAdded:projectIds.filter(id=>!asArray(current.project_ids).includes(id)),projectIdsRemoved:asArray(current.project_ids).filter(id=>!projectIds.includes(id)),cancelledOrStoppingTasks})]);
+     updated=(await tx.query('SELECT * FROM nodes WHERE id=$1 AND org_id=$2',[current.id,user.org_id])).rows[0];
+    });
+    return response(res,200,publicNode(updated,user.local_device_hash));
+   }
    const pairingMatch=path.match(/^\/api\/v1\/nodes\/([^/]+)\/pairing$/);
    if(pairingMatch&&method==='POST'){await body(req);return response(res,201,await createPairing(db,user,pairingMatch[1],req.headers['x-local-device']))}
    const nodeMatch=path.match(/^\/api\/v1\/nodes\/([^/]+)\/revoke$/);
@@ -142,9 +186,7 @@ export async function createApp({db,staticDir=resolve(import.meta.dirname,'../we
    }
    const connectionMatch=path.match(/^\/api\/v1\/connections\/([^/]+)$/);
    if(connectionMatch&&method==='GET'){const c=(await db.query('SELECT * FROM connections WHERE id=$1 AND org_id=$2 AND revoked_at IS NULL',[connectionMatch[1],user.org_id])).rows[0];if(!c)missing();allowed(user,c,await teamsFor(user));return response(res,200,publicConnection(c))}
-   if(connectionMatch&&method==='PATCH'){
-    const {rows}=await db.query('SELECT * FROM connections WHERE id=$1 AND org_id=$2',[connectionMatch[1],user.org_id]);const c=rows[0];if(!c)missing();if(c.owner_id!==user.id&&user.role!=='admin')denied();const b=await body(req),next={model:b.model??c.model,mode:b.mode??c.mode,allowedModels:b.allowedModels??asArray(c.allowed_models),allowOverride:b.allowOverride??c.allow_override,maxConcurrency:b.maxConcurrency??c.max_concurrency,allowAutoFailover:b.allowAutoFailover??c.allow_auto_failover};for(const projectId of asArray(c.project_ids)){const project=(await db.query('SELECT * FROM projects WHERE id=$1 AND org_id=$2',[projectId,user.org_id])).rows[0];if(project?.repo_type==='local'){const node=(await db.query('SELECT * FROM nodes WHERE id=$1 AND org_id=$2',[c.node_id,user.org_id])).rows[0];await requireLocalExecutionNode(db,user,project,node);if(next.allowAutoFailover||c.visibility!=='private')invalid('Local project connections must stay private and cannot enable automatic failover')}}const caps=parseJson((await db.query('SELECT capabilities FROM nodes WHERE id=$1',[c.node_id])).rows[0].capabilities);for(const m of next.allowedModels)if(!caps.tools.find(t=>t.tool===c.tool)?.models.some(x=>x.id===m))invalid('The node has not reported this model');modelMapping(caps,c.tool,next.model,next.mode);if(!next.allowedModels.includes(next.model)||typeof next.allowOverride!=='boolean'||typeof next.allowAutoFailover!=='boolean'||!Number.isInteger(next.maxConcurrency)||next.maxConcurrency<1||next.maxConcurrency>32)invalid('Invalid model, reasoning mode, access or concurrency');const out=await db.query('UPDATE connections SET model=$2,mode=$3,allowed_models=$4::jsonb,allow_override=$5,max_concurrency=$6,allow_auto_failover=$7 WHERE id=$1 RETURNING *',[c.id,next.model,next.mode,JSON.stringify(next.allowedModels),next.allowOverride,next.maxConcurrency,next.allowAutoFailover]);await audit(user,'connection.updated','connection',c.id,{model:next.model,mode:next.mode});return response(res,200,publicConnection(out.rows[0]));
-   }
+   if(connectionMatch&&method==='PATCH')return response(res,200,publicConnection(await editConnection(db,user,connectionMatch[1],await body(req),modelMapping)));
    if(path==='/api/v1/connections'&&method==='POST'){
     const b=await body(req);if(!one(b.name,160)||!TOOLS.has(b.tool)||!Array.isArray(b.projectIds)||!Array.isArray(b.allowedModels)||!b.allowedModels.length||b.allowedModels.length>100||b.allowAutoFailover!==undefined&&typeof b.allowAutoFailover!=='boolean')invalid('Connection details are incomplete');const n=await db.query('SELECT * FROM nodes WHERE id=$1 AND org_id=$2',[b.nodeId,user.org_id]);const node=n.rows[0];if(!node)fail(404,'connection_node_missing','Connection node was not found in this organization');if(node.owner_id!==user.id)denied();const teams=await teamsFor(user);allowed(user,node,teams);let hasLocalProject=false;for(const id of b.projectIds){const p=await requireProject(db,user,id);await requireLocalExecutionNode(db,user,p,node);if(p.repo_type==='local')hasLocalProject=true;if(!asArray(node.project_ids).includes(id))invalid(`Node is not authorized for project ${p.name}`)}const sc=await scopeFromRequest(db,user,b);if(hasLocalProject&&(sc.visibility!=='private'||b.allowAutoFailover===true))invalid('Connections for local projects must remain private and cannot enable automatic failover');const caps=parseJson(node.capabilities);const mapping=modelMapping(caps,b.tool,b.model,b.mode);if(b.allowedModels.some(id=>!caps.tools.find(x=>x.tool===b.tool)?.models.some(m=>m.id===id)))invalid('Allowed models must be reported by the selected node');if(!b.allowedModels.includes(b.model)||typeof b.allowOverride!=='boolean'||!Number.isInteger(b.maxConcurrency)||b.maxConcurrency<1||b.maxConcurrency>32)invalid('Invalid allowed models, override policy or concurrency');const id=randomUUID();const {rows}=await db.query('INSERT INTO connections(id,org_id,owner_id,name,node_id,tool,visibility,team_id,member_ids,project_ids,model,mode,allowed_models,allow_override,max_concurrency,allow_auto_failover) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13::jsonb,$14,$15,$16) RETURNING *',[id,user.org_id,user.id,b.name.trim(),node.id,b.tool,sc.visibility,sc.teamId,JSON.stringify(sc.memberIds),JSON.stringify(b.projectIds),mapping.model,mapping.mode,JSON.stringify(b.allowedModels),b.allowOverride,b.maxConcurrency,b.allowAutoFailover===true]);await audit(user,'connection.created','connection',id,{tool:b.tool});return response(res,201,publicConnection(rows[0]));
    }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { canAcceptReview, canReworkReview, checkpointTargetReady, cursorFileUrl, formatRecordedCost, localProjectConnections, nodeConfigSyncCommand, taskLifecycleActions, taskLifecycleActionsFor, validateBudget, validateChildren, validateReviewFeedback } from './workflows.mjs';
+import { canAcceptReview, canReworkReview, checkpointTargetReady, cursorFileUrl, formatRecordedCost, localProjectConnections, taskLifecycleActions, taskLifecycleActionsFor, validateBudget, validateChildren, validateReviewFeedback } from './workflows.mjs';
 
 test('lifecycle controls follow task state and hide actions while stopping', () => {
   assert.deepEqual(taskLifecycleActions('running'), ['pause', 'cancel']);
@@ -80,9 +80,8 @@ test('review controls require awaiting review, completed children, and leaf task
   assert.equal(canReworkReview({ status: 'awaiting_review', children: [{ status: 'completed' }] }), false);
 });
 
-test('review feedback is bounded and the node sync command is copyable', () => {
+test('review feedback is bounded', () => {
   assert.match(validateReviewFeedback('  '), /填写/);
   assert.match(validateReviewFeedback('x'.repeat(4001)), /4000/);
   assert.equal(validateReviewFeedback('请补充测试'), '');
-  assert.equal(nodeConfigSyncCommand(), 'npm run node -- --config "$PWD/node-config.json" --sync-config');
 });

@@ -131,6 +131,10 @@ For a decomposed workflow, review its children first; the parent can be accepted
 
 ## Synchronize an existing node configuration
 
+A node can serve multiple projects. Its owner can edit the existing node's name, sharing and project grants from the node list or detail view; editing preserves its ID, credentials and local pairing. A private local project bound to that node cannot be detached through node editing. Removing project access or narrowing sharing requests a safe stop for affected running work and cancels affected queued work; it does not transfer execution to another machine. Node grants and tool-connection grants are separate: authorize the added project on its tool connection as well, then synchronize the node's local repository mappings.
+
+Copied node commands use the installation directory and configuration file path explicitly. Fill both absolute paths for the execution computer in the node setup or detail panel; these non-credential preferences are remembered separately for each account and node. The installation directory must be the `console/` folder containing `package.json`. The generated `npm --prefix` commands can run from any terminal directory, tighten configuration permissions to mode 0600, and prompt for a missing node token without echoing it. Pairing asks for its short-lived code separately. Do not point a real node at disposable smoke-test configuration files or service URLs.
+
 After adding a local project, run this on the paired computer from `console/`:
 
 ```sh

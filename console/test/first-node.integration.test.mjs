@@ -11,12 +11,13 @@ import { createDatabase } from '../server/db.mjs';
 import { createApp } from '../server/app.mjs';
 import { AgentRunner } from '../node/runner.mjs';
 import { WorkerClient } from '../node/client.mjs';
+import { buildNodeSetupCommand } from '../web/onboarding.mjs';
 
 const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
 const execFileAsync = promisify(execFile);
 function runInteractiveCli(command, args, options) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { env: options.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { env: options.env, cwd: options.cwd, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', settled = false;
     const timer = setTimeout(() => child.kill('SIGKILL'), options.timeout || 10000);
     child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
@@ -69,7 +70,8 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   // Pair via the real CLI. The code is passed through stdin, and no paid provider is contacted.
   const pairing = (await api(`/nodes/${node.id}/pairing`, {})).data;
   const cliPath = join(dirname(dirname(new URL(import.meta.url).pathname)), 'node', 'index.mjs');
-  const pairRun = await runInteractiveCli(process.execPath, [cliPath, '--config', configPath, '--pair'], { input: pairing.code + '\n', env: { ...process.env, GAS_TOWN_NODE_TOKEN: token, GIT_CONFIG_NOSYSTEM: '1' }, timeout: 10000 });
+  const commandPaths={consoleDir:dirname(dirname(cliPath)),configPath};
+  const pairRun = await runInteractiveCli('/bin/bash', ['-c',buildNodeSetupCommand({...commandPaths,mode:'pair'})], { cwd:dir, input: pairing.code + '\n', env: { ...process.env, GAS_TOWN_NODE_TOKEN: token, GIT_CONFIG_NOSYSTEM: '1' }, timeout: 10000 });
   assert.equal(pairRun.status, 0, `${pairRun.stderr}\n${pairRun.stdout}`);
   assert.match(pairRun.stdout, /paired successfully/i);
   assert.ok(!pairRun.stdout.includes(token) && !pairRun.stderr.includes(token));
@@ -79,7 +81,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   assert.equal(project.repoType, 'local'); assert.equal(project.localNodeId, node.id);
 
   // Sync through the real CLI and verify restrictive permissions plus preservation/backup behavior.
-  const syncRun = await execFileAsync(process.execPath, [cliPath, '--config', configPath, '--sync-config'], { encoding: 'utf8', env: { ...process.env, GAS_TOWN_NODE_TOKEN: token, GIT_CONFIG_NOSYSTEM: '1' }, timeout: 10000 });
+  const syncRun = await execFileAsync('/bin/bash', ['-c',buildNodeSetupCommand({...commandPaths,mode:'sync-config'})], { cwd:dir, encoding: 'utf8', env: { ...process.env, GAS_TOWN_NODE_TOKEN: token, GIT_CONFIG_NOSYSTEM: '1' }, timeout: 10000 });
   assert.ok(!syncRun.stdout.includes(token) && !syncRun.stderr.includes(token));
   const synced = JSON.parse(await readFile(configPath, 'utf8'));
   assert.equal(synced.projects[project.id].repoPath, await realpath(repo));
@@ -95,7 +97,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   // --check discovers a deterministic fixture Codex model cache and authenticates without claiming tasks.
   const codexHome = join(dir, 'codex-home'); await mkdir(codexHome);
   await writeFile(join(codexHome, 'models_cache.json'), JSON.stringify([{ slug: 'fixture-codex', display_name: 'Fixture Codex', supported_reasoning_levels: [{ effort: 'high' }] }]));
-  const checkRun = await execFileAsync(process.execPath, [cliPath, '--config', configPath, '--check'], { encoding: 'utf8', env: { ...process.env, GAS_TOWN_NODE_TOKEN: token, CODEX_HOME: codexHome, GIT_CONFIG_NOSYSTEM: '1' }, timeout: 10000 });
+  const checkRun = await execFileAsync('/bin/bash', ['-c',buildNodeSetupCommand({...commandPaths,mode:'check'})], { cwd:dir, encoding: 'utf8', env: { ...process.env, GAS_TOWN_NODE_TOKEN: token, CODEX_HOME: codexHome, GIT_CONFIG_NOSYSTEM: '1' }, timeout: 10000 });
   assert.match(checkRun.stdout, /codex: OK \(1 supported models\)/);
   assert.ok(!checkRun.stdout.includes(token) && !checkRun.stderr.includes(token));
 
