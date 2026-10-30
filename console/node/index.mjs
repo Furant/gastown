@@ -9,6 +9,8 @@ import { resolveProject } from './workspace.mjs';
 import { ensureNodeCheckpointKeys } from './checkpoint.mjs';
 import { recoverJournals, acquireNodeLock, nodeJournalNamespace } from './journal.mjs';
 import { parseMappings, syncNodeConfig } from './config-sync.mjs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export function parseArgs(args){let configPath,once=false,check=false,pair=false,syncConfig=false;const maps=[];for(let i=0;i<args.length;i++){if(args[i]==='--help'||args[i]==='-h')return{help:true};if(args[i]==='--config')configPath=args[++i];else if(args[i]==='--once')once=true;else if(args[i]==='--check')check=true;else if(args[i]==='--pair')pair=true;else if(args[i]==='--sync-config')syncConfig=true;else if(args[i]==='--map')maps.push(args[++i]||'');else throw new Error(`Unknown argument: ${args[i]}`)}if(!configPath)throw new Error('Usage: node console/node/index.mjs --config /absolute/path/node-config.json [--once|--check|--pair|--sync-config]');if(Number(once)+Number(check)+Number(pair)+Number(syncConfig)>1)throw new Error('--sync-config, --pair, --once and --check cannot be combined');if(maps.length&&!syncConfig)throw new Error('--map requires --sync-config');return{configPath,once,check,...(pair?{pair:true}:{}),...(syncConfig?{syncConfig:true,maps:parseMappings(maps)}:{})}}
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -17,6 +19,10 @@ function capabilityViews(capabilities){
   const list=Array.isArray(capabilities?.tools)?capabilities.tools:Object.entries(capabilities?.tools||{}).map(([tool,value])=>({tool,models:value?.models||[]}));
   const map={};for(const tool of list)map[tool.tool]={models:tool.models||[]};
   return {reported:{tools:list},runner:{tools:map}};
+}
+export function runtimePathsFor(config){
+  if(typeof config?.configPath!=='string'||!path.isAbsolute(config.configPath))return undefined;
+  return {consoleDir:path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),configPath:path.resolve(config.configPath)};
 }
 export async function pairNode(client,{code,logger=console}={}){
   if(typeof code!=='string'||code.trim().length<12||code.length>256)throw new Error('A valid pairing code is required');
@@ -38,7 +44,7 @@ export async function checkNode(config,{client=new WorkerClient(config),capabili
   for(const [tool,entry] of configured){const executable=await fs.realpath(entry.command).catch(()=>{throw new Error(`${tool} executable does not exist: ${entry.command}`)});await fs.access(executable,fsConstants.X_OK).catch(()=>{throw new Error(`${tool} executable is not runnable: ${executable}`)})}
   const views=capabilityViews(capabilities||await discoverCapabilities(config));
   for(const [tool] of configured)if(!views.runner.tools[tool]?.models?.length)throw new Error(`${tool} CLI is present, but no supported signed-in models were discovered`);
-  await client.heartbeat(views.reported,checkpointKeys.publicKey);
+  await client.heartbeat(views.reported,checkpointKeys.publicKey,runtimePathsFor(config));
   logger.log(`Server authentication: OK (${config.serverUrl})`);for(const project of projects)logger.log(`Project ${project.id}: OK (${project.path}, ${project.baseBranch})`);for(const [tool] of configured)logger.log(`${tool}: OK (${views.runner.tools[tool].models.length} supported models)`);
   return {serverUrl:config.serverUrl,projects,tools:views.runner.tools};
 }
@@ -47,6 +53,7 @@ export async function startNode(config,{once=false,client:providedClient,capabil
   let runtimeConfig={...config,journalNamespace:nodeJournalNamespace(config)};
   const releaseNodeLock=config.configPath?await acquireNodeLock(config):async()=>{};
   let checkpointKeys,views,runner;
+  const runtimePaths=runtimePathsFor(config);
   const active=new Map();let stopping=false;
   const onSignal=()=>{stopping=true};signalSource.once('SIGINT',onSignal);signalSource.once('SIGTERM',onSignal);
   const runJob=job=>{const promise=runner.run(job).catch(error=>logger.error('task attempt failed',error.message)).finally(()=>active.delete(job.attemptId));active.set(job.attemptId,promise);return promise};
@@ -65,7 +72,7 @@ export async function startNode(config,{once=false,client:providedClient,capabil
     let nextHeartbeat=0,nextCapabilityRefresh=Date.now()+300000;
     do{
       if(Date.now()>=nextCapabilityRefresh){try{const updated=capabilityViews(await discoverCapabilitiesImpl(config));views.reported=updated.reported;views.runner=updated.runner;runner.capabilities=updated.runner}catch(error){logger.error('capability refresh failed',error.message)}nextCapabilityRefresh=Date.now()+300000}
-      if(Date.now()>=nextHeartbeat){nextHeartbeat=Date.now()+15000;try{const heartbeat=await client.heartbeat(views.reported,checkpointKeys.publicKey);if(heartbeat?.node?.id){runtimeConfig={...runtimeConfig,nodeId:heartbeat.node.id};if(runner)runner.config=runtimeConfig}consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}}
+      if(Date.now()>=nextHeartbeat){nextHeartbeat=Date.now()+15000;try{const heartbeat=await client.heartbeat(views.reported,checkpointKeys.publicKey,runtimePaths);if(heartbeat?.node?.id){runtimeConfig={...runtimeConfig,nodeId:heartbeat.node.id};if(runner)runner.config=runtimeConfig}consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}}
       const capacity=once?config.maxConcurrent:Math.max(0,config.maxConcurrent-Math.max(active.size,runner.running.size));
       let result;try{result=await client.poll({capacity});consecutiveFailures=0}catch(error){await handleWorkerError(error);if(stopping)break;continue}
       for(const cancellation of result.cancellations||[]){

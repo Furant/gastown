@@ -16,6 +16,7 @@ import {
   buildNodeCommand,
   buildNodeSetupCommand,
   nodePathPreferenceKey,
+  resolveNodeCommandPaths,
   readNodePathPreferences,
   saveNodePathPreferences,
   validNodeCommandPaths,
@@ -163,4 +164,22 @@ test('model authorization HTML preserves checked grants instead of emitting bool
  const html=renderAllowedModelChoices([{id:'allowed',name:'Allowed'},{id:'denied',name:'<script>Denied</script>'}],['allowed']);
  assert.match(html,/value="allowed" checked/);assert.doesNotMatch(html,/value="denied" checked/);assert.doesNotMatch(html,/<script>/);assert.match(html,/&lt;script&gt;/);
  const initial=renderAllowedModelChoices([{id:'default',name:'Default'}]);assert.match(initial,/value="default" checked/);
+});
+
+
+test('node-reported runtime paths fill commands automatically and explicit manual overrides can be reset', () => {
+  const node = {runtimePaths:{consoleDir:'/opt/gastown/console',configPath:'/srv/node/config.json'}};
+  const oldPreferences = {consoleDir:'/stale/console',configPath:'/stale/config.json'};
+  assert.deepEqual(resolveNodeCommandPaths(node,oldPreferences), {...node.runtimePaths,source:'reported'});
+  assert.deepEqual(resolveNodeCommandPaths(node,{...oldPreferences,source:'manual'}), {...oldPreferences,source:'manual'});
+  assert.deepEqual(resolveNodeCommandPaths(node,{}), {...node.runtimePaths,source:'reported'});
+  assert.deepEqual(resolveNodeCommandPaths({},oldPreferences), {...oldPreferences,source:'saved'});
+  assert.deepEqual(resolveNodeCommandPaths({runtimePaths:{consoleDir:'relative',configPath:'/x'}},{}), {consoleDir:'',configPath:'',source:'missing'});
+});
+
+test('node path preference records explicit manual choice without storing other node metadata', () => {
+  const values=new Map(),storage={getItem:key=>values.get(key),setItem:(key,value)=>values.set(key,value)};
+  saveNodePathPreferences(storage,'owner','node',{consoleDir:'/manual',configPath:'/manual.json',source:'manual',runtimePaths:{private:'ignored'}});
+  assert.deepEqual(readNodePathPreferences(storage,'owner','node'),{consoleDir:'/manual',configPath:'/manual.json',source:'manual'});
+  assert.equal([...values.values()][0].includes('private'),false);
 });

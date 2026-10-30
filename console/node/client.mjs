@@ -16,7 +16,7 @@ export class WorkerClient{
       return payload.data;
     }catch(error){if(error.name==='AbortError')throw new Error('Worker API request timed out');throw error}finally{clearTimeout(timer)}
   }
-  heartbeat(capabilities,checkpointPublicKey){return this.request('heartbeat',{capabilities,...(checkpointPublicKey?{checkpointPublicKey}:{})})}
+  heartbeat(capabilities,checkpointPublicKey,runtimePaths){return this.request('heartbeat',{capabilities,...(checkpointPublicKey?{checkpointPublicKey}:{}),...(runtimePaths?{runtimePaths}:{})})}
   pair(code){if(typeof code!=='string'||code.trim().length<12||code.length>256)throw new Error('Invalid local node pairing code');return this.request('pair',{code:code.trim()})}
   config(){return this.request('config',{})}
   poll({capacity=1}={}){return this.request('poll',{capacity})}

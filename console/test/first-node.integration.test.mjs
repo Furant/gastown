@@ -100,6 +100,9 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   const checkRun = await execFileAsync('/bin/bash', ['-c',buildNodeSetupCommand({...commandPaths,mode:'check'})], { cwd:dir, encoding: 'utf8', env: { ...process.env, GAS_TOWN_NODE_TOKEN: token, CODEX_HOME: codexHome, GIT_CONFIG_NOSYSTEM: '1' }, timeout: 10000 });
   assert.match(checkRun.stdout, /codex: OK \(1 supported models\)/);
   assert.ok(!checkRun.stdout.includes(token) && !checkRun.stderr.includes(token));
+  const discovered=(await api('/nodes')).data.find(item=>item.id===node.id);
+  assert.deepEqual(discovered.runtimePaths,{consoleDir:await realpath(commandPaths.consoleDir),configPath});
+  assert.ok(discovered.runtimePathsReportedAt);
 
   const caps = { tools: [{ tool: 'codex', models: [{ id: 'fixture-codex', name: 'Fixture Codex', modes: ['high'], nativeByMode: { high: 'fixture-codex' } }] }] };
   const client = new WorkerClient({ serverUrl: base, token });

@@ -9,6 +9,13 @@ test('worker requests use bearer auth and unwrap the API envelope',async()=>{
   const result=await client.poll();assert.deepEqual(result,{jobs:[],cancellations:[{attemptId:'a'}]});assert.equal(seen.url,'http://localhost:8768/api/v1/worker/poll');assert.equal(seen.init.headers.authorization,'Bearer node-secret');
 });
 
+test('heartbeat can report only the runtime paths explicitly supplied by the local node',async()=>{
+  let body;const client=new WorkerClient({serverUrl:'http://localhost:8768',token:'node-secret',fetchImpl:async(_url,init)=>{body=JSON.parse(init.body);return{ok:true,json:async()=>({data:{node:{id:'node-1'}}})}}});
+  const paths={consoleDir:'/opt/gastown/console',configPath:'/Users/alice/node config.json'};
+  await client.heartbeat({tools:[]},undefined,paths);
+  assert.deepEqual(body,{capabilities:{tools:[]},runtimePaths:paths});
+});
+
 test('worker config fetch is a one-shot authenticated empty POST',async()=>{
   let seen;const client=new WorkerClient({serverUrl:'http://localhost:8768',token:'node-secret',fetchImpl:async(url,init)=>{seen={url,init};return{ok:true,json:async()=>({data:{nodeId:'node-1',projects:[]}})}}});
   assert.deepEqual(await client.config(),{nodeId:'node-1',projects:[]});assert.equal(seen.url,'http://localhost:8768/api/v1/worker/config');assert.equal(seen.init.method,'POST');assert.equal(seen.init.body,'{}');

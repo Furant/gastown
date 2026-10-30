@@ -53,6 +53,28 @@ test('legacy node project grants migrate once into projects and never reappear',
  }finally{await rm(dataDir,{recursive:true,force:true});}
 });
 
+test('reported runtime paths are validated, retained on legacy heartbeats, and visible only to the node owner',async t=>{
+ const x=await ownerFixture(t),node=(await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie})).json.data[0];
+ const paths={consoleDir:'/opt/gastown/console',configPath:'/Users/alice/private node.json'};
+ const report=await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:x.token,body:{capabilities:{tools:[]},runtimePaths:paths}});
+ assert.equal(report.status,200,JSON.stringify(report.json));assert.equal(JSON.stringify(report.json).includes(paths.configPath),false,'heartbeat response does not echo private paths');
+ let listed=await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie});assert.deepEqual(listed.json.data.find(item=>item.id===node.id).runtimePaths,paths);assert.ok(listed.json.data.find(item=>item.id===node.id).runtimePathsReportedAt);
+ const before=(await x.f.db.query('SELECT runtime_paths,runtime_paths_reported_at,online_at FROM nodes WHERE id=$1',[node.id])).rows[0];
+ const invalid=await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:x.token,body:{capabilities:{tools:[]},runtimePaths:{...paths,token:randomUUID()}}});assert.equal(invalid.status,400);
+ const afterInvalid=(await x.f.db.query('SELECT runtime_paths,runtime_paths_reported_at,online_at FROM nodes WHERE id=$1',[node.id])).rows[0];assert.deepEqual(afterInvalid,before,'invalid reports do not partially refresh heartbeat or overwrite paths');
+ const legacy=await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:x.token,body:{capabilities:{tools:[]}}});assert.equal(legacy.status,200);
+ const afterLegacy=(await x.f.db.query('SELECT runtime_paths,runtime_paths_reported_at FROM nodes WHERE id=$1',[node.id])).rows[0];assert.deepEqual(afterLegacy.runtime_paths,paths);assert.equal(new Date(afterLegacy.runtime_paths_reported_at).getTime(),new Date(before.runtime_paths_reported_at).getTime());
+ const member=await req(x.f,'/api/v1/members',{method:'POST',...x.auth,body:{name:'Node viewer',email:'runtime-viewer@example.test',password:fixturePassword('runtime-viewer-password')}});
+ const adminPeer=await req(x.f,'/api/v1/members',{method:'POST',...x.auth,body:{name:'Non-owner admin',email:'runtime-admin@example.test',password:fixturePassword('runtime-admin-password')}});
+ await x.f.db.query("UPDATE users SET role='admin' WHERE id=$1",[adminPeer.json.data.id]);
+ const scope=await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{visibility:'custom',memberIds:[member.json.data.id,adminPeer.json.data.id]}});assert.equal(scope.status,200);
+ for(const [email,pass] of [['runtime-viewer@example.test','runtime-viewer-password'],['runtime-admin@example.test','runtime-admin-password']]){
+  const login=await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email,password:fixturePassword(pass)}}),cookie=login.headers.get('set-cookie').split(';')[0];
+  const visible=(await req(x.f,'/api/v1/nodes',{cookie})).json.data.find(item=>item.id===node.id);assert.ok(visible);assert.equal(Object.hasOwn(visible,'runtimePaths'),false);assert.equal(Object.hasOwn(visible,'runtimePathsReportedAt'),false);
+  const capabilities=await req(x.f,`/api/v1/capabilities?nodeId=${node.id}`,{cookie});assert.equal(JSON.stringify(capabilities.json).includes(paths.configPath),false);
+ }
+});
+
 async function req(f, path, {method='GET',body,token,cookie,csrf,device}={}) {
   const headers={};
   if(body!==undefined) headers['content-type']='application/json';

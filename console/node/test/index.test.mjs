@@ -5,7 +5,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { startNode, parseArgs, checkNode, pairNode } from '../index.mjs';
+import { fileURLToPath } from 'node:url';
+import { startNode, parseArgs, checkNode, pairNode, runtimePathsFor } from '../index.mjs';
 import { acquireNodeLock, journalDirectory, writeJournal } from '../journal.mjs';
 
 test('node sends zero capacity while a leased task occupies its only slot',async()=>{
@@ -55,10 +56,18 @@ test('node preflight checks local setup and authenticates without polling for wo
   assert.equal(heartbeats,1);assert.equal(polls,0);assert.ok(logs.some(line=>line.includes('Server authentication: OK')));
 });
 
-test('preflight accepts frozen loaded config and preserves the caller after heartbeat',async()=>{
-  const config=Object.freeze({serverUrl:'http://localhost:8768',projects:{},tools:{codex:{command:process.execPath}},worktreesDir:'/tmp/node-freeze-test'});let seen;
-  await checkNode(config,{client:{heartbeat:async()=>({node:{id:'server-node'}})},capabilities:{tools:[{tool:'codex',models:[{id:'fixture'}]}]},logger:{log(){}}});
+test('preflight accepts frozen loaded config and preserves the caller after heartbeat',async t=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'node-freeze-test-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+  const config=Object.freeze({serverUrl:'http://localhost:8768',configPath:path.join(root,'config.json'),projects:{},tools:{codex:{command:process.execPath}},worktreesDir:root});let seen;
+  await checkNode(config,{client:{heartbeat:async(...args)=>{seen=args;return {node:{id:'server-node'}}}},capabilities:{tools:[{tool:'codex',models:[{id:'fixture'}]}]},logger:{log(){}}});
   assert.equal(config.nodeId,undefined);assert.equal(Object.isFrozen(config),true);
+  assert.deepEqual(seen[2],runtimePathsFor(config));
+});
+
+test('runtime path discovery reports the installed console package and actual absolute config path',()=>{
+  const paths=runtimePathsFor({configPath:'/tmp/path with spaces/node.json'});
+  assert.deepEqual(paths,{consoleDir:path.dirname(fileURLToPath(new URL('../../package.json',import.meta.url))),configPath:'/tmp/path with spaces/node.json'});
+  assert.equal(runtimePathsFor({configPath:'relative.json'}),undefined);
 });
 
 test('worker startup copies heartbeat node identity into runner config without mutating frozen caller',async()=>{

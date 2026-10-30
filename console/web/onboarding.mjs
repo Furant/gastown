@@ -72,6 +72,13 @@ export function validNodeCommandPaths(paths) {
   catch { return false; }
 }
 
+export function resolveNodeCommandPaths(node, preferences = {}) {
+  const saved = { consoleDir: preferences.consoleDir || '', configPath: preferences.configPath || '' };
+  if (preferences.source === 'manual') return { ...saved, source: 'manual' };
+  if (validNodeCommandPaths(node?.runtimePaths)) return { consoleDir: node.runtimePaths.consoleDir, configPath: node.runtimePaths.configPath, source: 'reported' };
+  return { ...saved, source: validNodeCommandPaths(saved) ? 'saved' : 'missing' };
+}
+
 export function nodePathPreferenceKey(ownerId, nodeId) {
   if (!ownerId || !nodeId) return '';
   return `gastown.node-paths.v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(nodeId)}`;
@@ -79,14 +86,14 @@ export function nodePathPreferenceKey(ownerId, nodeId) {
 
 export function readNodePathPreferences(storage, ownerId, nodeId) {
   const key = nodePathPreferenceKey(ownerId, nodeId);
-  try { const value = key ? JSON.parse(storage?.getItem(key) || '{}') : {}; return { consoleDir: value.consoleDir || '', configPath: value.configPath || '' }; }
+  try { const value = key ? JSON.parse(storage?.getItem(key) || '{}') : {}; return { consoleDir: value.consoleDir || '', configPath: value.configPath || '', ...(value.source === 'manual' ? { source: 'manual' } : {}) }; }
   catch { return { consoleDir: '', configPath: '' }; }
 }
 
 export function saveNodePathPreferences(storage, ownerId, nodeId, paths) {
   const key = nodePathPreferenceKey(ownerId, nodeId);
   if (!key) return false;
-  try { storage?.setItem(key, JSON.stringify({ consoleDir: paths?.consoleDir || '', configPath: paths?.configPath || '' })); return true; }
+  try { storage?.setItem(key, JSON.stringify({ consoleDir: paths?.consoleDir || '', configPath: paths?.configPath || '', ...(paths?.source === 'manual' ? { source: 'manual' } : {}) })); return true; }
   catch { return false; }
 }
 
