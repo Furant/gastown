@@ -61,6 +61,7 @@ process.stdin.on('end', () => {
   t.after(() => rm(root, { recursive: true, force: true }));
 
   for (const shell of shells) {
+    await writeFile(configPath, JSON.stringify({ serverUrl: 'http://127.0.0.1:8768', projects: {}, tools: { codex: { command: '/fixture/codex' } } }));
     for (const [mode, expectedModeArgs, input] of modes) {
       const observationPath = join(observationsDir, `${shell.split('/').at(-1)}-${mode}.json`);
       const command = buildNodeSetupCommand({ consoleDir, configPath, mode });
@@ -104,6 +105,25 @@ process.stdin.on('end', () => {
     assert.equal(observed.tokenPresent, true);
     assert.deepEqual(observed.args, ['--config', configPath, '--pair']);
     assert.equal(observed.input, `${pairingCode}\n`, 'the setup wrapper should consume only the token line');
+    assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+
+    const savedToken = randomBytes(32).toString('hex');
+    await writeFile(configPath, JSON.stringify({ token: savedToken }));
+    const savedTokenObservation = join(observationsDir, `${shell.split('/').at(-1)}-pair-saved-token.json`);
+    const savedTokenEnv = {
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'GAS_TOWN_NODE_TOKEN')),
+      NODE_COMMAND_OBSERVATION: savedTokenObservation,
+    };
+    const savedTokenCommand = buildNodeSetupCommand({ consoleDir, configPath, mode: 'pair' });
+    assert.ok(!savedTokenCommand.includes(savedToken), 'saved token must not be embedded in the command');
+    const savedTokenResult = await runShell(shell, savedTokenCommand, { cwd: unrelatedDir, env: savedTokenEnv, input: `${pairingCode}\n` });
+    assert.equal(savedTokenResult.code, 0, `${shell} pair with saved token failed: ${savedTokenResult.stderr}`);
+    assert.ok(!savedTokenResult.stdout.includes('GAS_TOWN_NODE_TOKEN:'), 'saved config token should suppress the token prompt');
+    assert.ok(!savedTokenResult.stdout.includes(savedToken) && !savedTokenResult.stderr.includes(savedToken));
+    const savedTokenObserved = JSON.parse(await readFile(savedTokenObservation, 'utf8'));
+    assert.equal(savedTokenObserved.tokenPresent, false, 'wrapper must leave the saved token in config rather than exporting it');
+    assert.deepEqual(savedTokenObserved.args, ['--config', configPath, '--pair']);
+    assert.equal(savedTokenObserved.input, `${pairingCode}\n`, 'saved-token check must not consume the pairing code');
     assert.equal((await stat(configPath)).mode & 0o777, 0o600);
 
     const missingConfig = join(configDir, 'does-not-exist.json');

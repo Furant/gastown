@@ -63,7 +63,7 @@ export function buildNodeCommand({ consoleDir, configPath, mode = 'start' } = {}
 export function buildNodeSetupCommand({ consoleDir, configPath, mode = 'start' } = {}) {
   const config = shellQuoteNodePath(configPath);
   const command = buildNodeCommand({ consoleDir, configPath, mode });
-  const secureToken = `if [ -z "\${GAS_TOWN_NODE_TOKEN:-}" ]; then printf '%s' 'GAS_TOWN_NODE_TOKEN: '; IFS= read -r -s GAS_TOWN_NODE_TOKEN; printf '\\n'; fi; export GAS_TOWN_NODE_TOKEN; `;
+  const secureToken = `if [ -z "\${GAS_TOWN_NODE_TOKEN:-}" ]; then if ! node -e 'try { const config = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.exit(typeof config.token === "string" && config.token.length >= 24 && config.token.length <= 512 ? 0 : 1); } catch { process.exit(1); }' ${config} >/dev/null 2>&1; then printf '%s' 'GAS_TOWN_NODE_TOKEN: '; IFS= read -r -s GAS_TOWN_NODE_TOKEN; printf '\\n'; export GAS_TOWN_NODE_TOKEN; fi; fi; `;
   return `(\nset -e\nif [ ! -f ${config} ]; then printf '%s\\n' 'node-config.json was not found at the configured path.' >&2; exit 1; fi\nchmod 600 ${config}\n${secureToken}${command}\n)`;
 }
 

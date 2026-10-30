@@ -63,7 +63,7 @@ npm run node -- --config "$PWD/node-config.json" --check
 npm run node -- --config "$PWD/node-config.json"
 ```
 
-Use `read -s GAS_TOWN_NODE_TOKEN` in zsh; the `read -rs` example is for bash. The token can alternatively be entered into the protected local config as `token`, with the same file permissions.
+Use `read -s GAS_TOWN_NODE_TOKEN` in zsh; the `read -rs` example is for bash. The token can alternatively be entered into the protected local config as `token`, with the same file permissions. Copied setup commands prompt only when neither the environment nor the protected config contains a valid-length token; a pairing code is entered separately and cannot replace the node token.
 
 Compatible execution nodes automatically report their installed console directory and loaded config file path during startup and `--check`. Node owners see these actual paths prefilled in node details, including remote machine paths; shared viewers and other administrators do not receive them. Offline nodes retain the last report with its timestamp. Explicit manual overrides remain local to that owner/browser/node and can be reset with **Use node-reported paths**. Older workers must restart with the updated code before reporting paths. A never-connected machine cannot be inspected by the browser: its first setup still needs to run on that machine; the console does not scan disks or guess remote directories.
 
