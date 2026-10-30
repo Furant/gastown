@@ -139,6 +139,16 @@ export function nodeStatus(node) {
   return node.status || 'offline';
 }
 
+export function localProjectNodeChoices(nodes, ownerId) {
+  return (Array.isArray(nodes) ? nodes : [])
+    .filter(node => node?.ownerId === ownerId && !node.revokedAt)
+    .map(node => ({ ...node, ready: node.pairedToThisDevice === true }));
+}
+
+export function canSaveLocalProject(nodes, selectedNodeId) {
+  return (nodes || []).some(node => node.id === selectedNodeId && node.ready === true);
+}
+
 export function githubPrUrl(value) {
   try {
     const url = new URL(value);

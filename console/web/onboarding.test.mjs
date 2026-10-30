@@ -21,7 +21,22 @@ import {
   saveNodePathPreferences,
   validNodeCommandPaths,
   createSessionEpochGuard,
+  localProjectNodeChoices,
+  canSaveLocalProject,
 } from './onboarding.mjs';
+
+test('local project node choices include owned unpaired nodes but exclude shared and revoked nodes', () => {
+  const choices = localProjectNodeChoices([
+    { id: 'paired', ownerId: 'me', pairedToThisDevice: true, onlineAt: 'now' },
+    { id: 'needs-pair', ownerId: 'me', pairedToThisDevice: false },
+    { id: 'shared', ownerId: 'other', pairedToThisDevice: true },
+    { id: 'revoked', ownerId: 'me', revokedAt: 'now' },
+  ], 'me');
+  assert.deepEqual(choices.map(node => [node.id, node.ready]), [['paired', true], ['needs-pair', false]]);
+  assert.equal(canSaveLocalProject(choices, 'paired'), true);
+  assert.equal(canSaveLocalProject(choices, 'needs-pair'), false);
+  assert.equal(canSaveLocalProject(choices, ''), false);
+});
 
 test('builds a token-free node config from mapped projects and CLI paths', () => {
   const config = buildNodeConfig({
