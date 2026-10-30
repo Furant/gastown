@@ -42,10 +42,6 @@ export function buildNodeConfig({ serverUrl, projects, cliPaths }) {
   };
 }
 
-export function nodeProjectIds(values) {
-  return Array.isArray(values?.projectIds) ? [...values.projectIds] : [];
-}
-
 export function renderAllowedModelChoices(models, allowedModels) {
   return models.map(model => {
     const selected = !allowedModels?.length || allowedModels.includes(model.id);

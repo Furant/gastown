@@ -60,11 +60,11 @@ console.log(JSON.stringify({type:'result',result:'Preserved original changes; ta
   await new Promise(resolve => app.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${app.address().port}`;
   let cookie, csrf;
-  async function request(path, body, auth = true) {
+  async function request(path, body, auth = true, method = body === undefined ? 'GET' : 'POST') {
     const headers = { 'content-type': 'application/json', origin: base };
     if (auth && cookie) headers.cookie = cookie;
     if (auth && csrf) headers['x-csrf-token'] = csrf;
-    const res = await fetch(base + '/api/v1' + path, { method: body === undefined ? 'GET' : 'POST', headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    const res = await fetch(base + '/api/v1' + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
     const json = await res.json();
     assert.ok(res.ok, `${path}: ${res.status} ${json.error?.message || ''}`);
     return { data: json.data, headers: res.headers };
@@ -73,7 +73,8 @@ console.log(JSON.stringify({type:'result',result:'Preserved original changes; ta
   cookie = boot.headers.get('set-cookie').split(';')[0];
   csrf = boot.data.csrfToken;
   const project = (await request('/projects', { name: 'Fixture repo', repoUrl: 'https://github.com/fixture/repo.git', baseBranch: 'main', visibility: 'private' })).data;
-  const node = (await request('/nodes', { name: 'Fixture node', visibility: 'private', projectIds: [project.id] })).data;
+  const node = (await request('/nodes', { name: 'Fixture node', visibility: 'private' })).data;
+  await request('/projects/'+project.id, {nodeIds:[node.id]}, true, 'PATCH');
   const client = new WorkerClient({ serverUrl: base, token: node.token });
   const capabilities = { tools: [
     { tool: 'codex', models: [{ id: 'fixture-codex', name: 'Fixture Codex', modes: ['high'], nativeByMode: { high: 'fixture-codex' } }] },

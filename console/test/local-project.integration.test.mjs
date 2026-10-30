@@ -50,7 +50,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   await client.pair(pairing.code);
   const project = (await api('/projects',{name:'Local fixture repo',repoType:'local',localPath:repo,localNodeId:node.id,baseBranch:'main',visibility:'private'})).data;
   assert.equal(project.repoType,'local');
-  const foreign = (await api('/nodes',{name:'Other machine',visibility:'private',projectIds:[]})).data;
+  const foreign = (await api('/nodes',{name:'Other machine',visibility:'private'})).data;
   const foreignClient = new WorkerClient({serverUrl:base,token:foreign.token}); await foreignClient.heartbeat(caps);
   const connection = (await api('/connections', { name: 'Fixture Codex', nodeId: node.id, tool: 'codex', visibility: 'private', projectIds: [project.id], model: 'fixture-codex', mode: 'high', allowedModels: ['fixture-codex'], allowOverride: true, maxConcurrency: 1 })).data;
   const task = (await api('/tasks', { title: 'Measure actual CLI usage', description: 'Record structured provider usage for plan and execution', projectId: project.id, connectionId: connection.id })).data;

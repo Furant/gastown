@@ -1,6 +1,10 @@
 import { randomBytes } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { createDatabase } from './db.mjs';
 import { createApp } from './app.mjs';
 import { generateCheckpointKeys, sealCheckpoint, openCheckpoint } from '../shared/checkpoint-crypto.mjs';
@@ -22,6 +26,32 @@ async function fixture() {
   });
   return { db, app, base, close: async () => { await new Promise(r => app.close(r)); await db.close(); } };
 }
+
+test('legacy node project grants migrate once into projects and never reappear',async()=>{
+ const dataDir=await mkdtemp(join(tmpdir(),'gastown-project-node-migration-'));
+ try{
+  let db=await createDatabase({dataDir});const org=randomUUID(),owner=randomUUID(),node=randomUUID(),remote=randomUUID(),local=randomUUID();
+  await db.query('INSERT INTO orgs(id,name) VALUES($1,$2)',[org,'Migration test']);
+  await db.query('INSERT INTO users(id,org_id,name,email,password_hash) VALUES($1,$2,$3,$4,$5)',[owner,org,'Owner',`${owner}@example.test`,'unused']);
+  await db.query("INSERT INTO nodes(id,org_id,owner_id,name,visibility,project_ids,token_hash) VALUES($1,$2,$3,$4,'private',$5::jsonb,$6)",[node,org,owner,'Legacy node',JSON.stringify([remote,local]),`token-${node}`]);
+  await db.query("INSERT INTO projects(id,org_id,owner_id,name,repo_url,base_branch,visibility,node_ids) VALUES($1,$2,$3,'Remote','https://github.com/a/b.git','main','private','[]')",[remote,org,owner]);
+  await db.query("INSERT INTO projects(id,org_id,owner_id,name,repo_url,base_branch,visibility,repo_type,local_path,local_node_id,node_ids) VALUES($1,$2,$3,'Local','','main','private','local','/repo',$4,'[]')",[local,org,owner,node]);
+  const wrongNode=randomUUID(),foreignOrg=randomUUID(),foreignOwner=randomUUID(),foreignProject=randomUUID();
+  await db.query('INSERT INTO orgs(id,name) VALUES($1,$2)',[foreignOrg,'Other migration org']);
+  await db.query('INSERT INTO users(id,org_id,name,email,password_hash) VALUES($1,$2,$3,$4,$5)',[foreignOwner,foreignOrg,'Foreign owner',`${foreignOwner}@example.test`,'unused']);
+  await db.query("INSERT INTO projects(id,org_id,owner_id,name,repo_url,base_branch,visibility,node_ids) VALUES($1,$2,$3,'Foreign','https://github.com/a/foreign.git','main','private','[]')",[foreignProject,foreignOrg,foreignOwner]);
+  await db.query("INSERT INTO nodes(id,org_id,owner_id,name,visibility,project_ids,token_hash) VALUES($1,$2,$3,$4,'private',$5::jsonb,$6)",[wrongNode,org,owner,'Wrong legacy local node',JSON.stringify([local,foreignProject]),`token-${wrongNode}`]);
+  await db.query("DELETE FROM schema_migrations WHERE version='project-node-selection-v1'");await db.close();
+  db=await createDatabase({dataDir});
+  const migrated=(await db.query('SELECT id,node_ids FROM projects ORDER BY id')).rows,remoteRow=migrated.find(x=>x.id===remote),localRow=migrated.find(x=>x.id===local);
+  assert.deepEqual(remoteRow.node_ids,[node]);assert.deepEqual(localRow.node_ids,[node]);
+  assert.deepEqual(migrated.find(x=>x.id===foreignProject).node_ids,[],'legacy grants cannot cross organizations');
+  assert.deepEqual((await db.query('SELECT project_ids FROM nodes WHERE id=$1',[wrongNode])).rows[0].project_ids,[]);
+  assert.deepEqual((await db.query('SELECT project_ids FROM nodes WHERE id=$1',[node])).rows[0].project_ids,[]);
+  await db.query("UPDATE projects SET node_ids='[]'::jsonb WHERE id=$1",[remote]);await db.query('UPDATE nodes SET project_ids=$2::jsonb WHERE id=$1',[node,JSON.stringify([remote])]);await db.close();
+  db=await createDatabase({dataDir});assert.deepEqual((await db.query('SELECT node_ids FROM projects WHERE id=$1',[remote])).rows[0].node_ids,[]);await db.close();
+ }finally{await rm(dataDir,{recursive:true,force:true});}
+});
 
 async function req(f, path, {method='GET',body,token,cookie,csrf,device}={}) {
   const headers={};
@@ -49,8 +79,9 @@ async function ownerFixture(t) {
   assert.equal(team.status,201);
   const project=await req(f,'/api/v1/projects',{method:'POST',...auth,body:{name:'Repo',repoUrl:'https://github.com/team/repo.git',baseBranch:'main',visibility:'private'}});
   assert.equal(project.status,201);
-  const node=await req(f,'/api/v1/nodes',{method:'POST',...auth,body:{name:'Owner Mac',visibility:'private',projectIds:[project.json.data.id]}});
+  const node=await req(f,'/api/v1/nodes',{method:'POST',...auth,body:{name:'Owner Mac',visibility:'private'}});
   assert.equal(node.status,201);
+  assert.equal((await req(f,`/api/v1/projects/${project.json.data.id}`,{method:'PATCH',...auth,body:{nodeIds:[node.json.data.id]}})).status,200);
   const token=node.json.data.token;
   const caps=await req(f,'/api/v1/capabilities?nodeId='+node.json.data.id,{cookie,csrf});
   assert.equal(caps.status,200);
@@ -102,7 +133,7 @@ test('member disable revokes login, session and owned node credentials while pro
  assert.equal((await req(x.f,'/api/v1/members/'+(await req(x.f,'/api/v1/auth/me',{cookie:x.auth.cookie})).json.data.user.id,{method:'PATCH',...x.auth,body:{role:'member'}})).json.error.code,'last_admin');
  const node=await req(x.f,'/api/v1/nodes',{method:'POST',...memberAuth,body:{name:'Member node',visibility:'private',projectIds:[]}});
  assert.equal(node.status,201);
- const sharedNode=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Shared node',visibility:'custom',memberIds:[made.json.data.id],projectIds:[x.project]}});
+ const sharedNode=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Shared node',visibility:'custom',memberIds:[made.json.data.id]}});
  assert.equal(sharedNode.status,201);
  const disabled=await req(x.f,`/api/v1/members/${made.json.data.id}`,{method:'PATCH',...x.auth,body:{disabled:true}});
  assert.equal(disabled.status,200);assert.ok(disabled.json.data.disabledAt);
@@ -164,7 +195,8 @@ test('removing a member from a shared team requests worker stop and cancels with
  const team=(await req(x.f,'/api/v1/teams',{cookie:x.auth.cookie})).json.data[0];
  await req(x.f,`/api/v1/teams/${team.id}`,{method:'PATCH',...x.auth,body:{memberIds:[member.json.data.id]}});
  const project=await req(x.f,'/api/v1/projects',{method:'POST',...x.auth,body:{name:'Team repo',repoUrl:'https://github.com/team/shared.git',baseBranch:'main',visibility:'custom',memberIds:[member.json.data.id]}});
- const node=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Team runner',visibility:'team',teamId:team.id,projectIds:[project.json.data.id]}});
+ const node=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Team runner',visibility:'team',teamId:team.id}});
+ await req(x.f,`/api/v1/projects/${project.json.data.id}`,{method:'PATCH',...x.auth,body:{nodeIds:[node.json.data.id]}});
  const caps={tools:[{tool:'codex',models:[{id:'codex-default',name:'Codex default',modes:['high']}]}]};
  await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:node.json.data.token,body:{capabilities:caps}});
  const conn=await req(x.f,'/api/v1/connections',{method:'POST',...x.auth,body:{name:'Team Codex',nodeId:node.json.data.id,tool:'codex',visibility:'custom',memberIds:[member.json.data.id],projectIds:[project.json.data.id],model:'codex-default',mode:'high',allowedModels:['codex-default'],allowOverride:false,maxConcurrency:1}});
@@ -312,11 +344,14 @@ test('decomposition validates DAG and parent approval schedules only dependency 
 
 test('cross-node handoff stores ciphertext and releases target only after stop acknowledgment',async t=>{
  const x=await approvedRunning(t),keys=generateCheckpointKeys();
- const targetNode=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Target node',visibility:'private',projectIds:[x.project]}});
- const targetToken=targetNode.json.data.token,targetId=targetNode.json.data.id;
+ const targetNode=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Target node',visibility:'private'}});
+ const targetToken=targetNode.json.data.token,targetId=targetNode.json.data.id;const originalNodeId=(await x.f.db.query('SELECT node_id FROM connections WHERE id=$1',[x.source])).rows[0].node_id;await req(x.f,`/api/v1/projects/${x.project}`,{method:'PATCH',...x.auth,body:{nodeIds:[originalNodeId,targetId]}});
  const caps=(await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:x.token,body:{capabilities:{tools:[{tool:'codex',models:[{id:'codex-default',name:'Codex',modes:['low','high']}]},{tool:'cursor',models:[{id:'cursor-default',name:'Cursor',modes:['fast','deep']}]}]}}}));assert.equal(caps.status,200);
  await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:targetToken,body:{checkpointPublicKey:keys.publicKey,capabilities:{tools:[{tool:'codex',models:[{id:'codex-default',name:'Codex',modes:['low','high']}]},{tool:'cursor',models:[{id:'cursor-default',name:'Cursor',modes:['fast','deep']}]}]}}});
  const connection=await req(x.f,'/api/v1/connections',{method:'POST',...x.auth,body:{name:'Remote Codex',nodeId:targetId,tool:'codex',visibility:'private',projectIds:[x.project],model:'codex-default',mode:'high',allowedModels:['codex-default'],allowOverride:true,maxConcurrency:1}});assert.equal(connection.status,201);
+ await req(x.f,`/api/v1/projects/${x.project}`,{method:'PATCH',...x.auth,body:{nodeIds:[originalNodeId]}});
+ const unselected=await req(x.f,`/api/v1/tasks/${x.task}/transfer`,{method:'POST',...x.auth,body:{connectionId:connection.json.data.id}});assert.equal(unselected.status,403);assert.equal((await req(x.f,`/api/v1/tasks/${x.task}`,{cookie:x.auth.cookie})).json.data.status,'running');
+ await req(x.f,`/api/v1/projects/${x.project}`,{method:'PATCH',...x.auth,body:{nodeIds:[originalNodeId,targetId]}});
  const transfer=await req(x.f,`/api/v1/tasks/${x.task}/transfer`,{method:'POST',...x.auth,body:{connectionId:connection.json.data.id}});assert.equal(transfer.status,202);
  const sourceStop=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.cancellations[0];assert.equal(sourceStop.handoff.targetNodeId,targetId);
  const context={taskId:x.task,projectId:x.project,sourceAttemptId:x.attempt.attemptId,targetNodeId:targetId,transferId:sourceStop.handoff.transferId};
@@ -344,6 +379,20 @@ test('handoff cannot start target before source stop ack; preserves one current 
  assert.equal(poll.json.data.jobs[0].tool,'cursor');assert.equal(poll.json.data.jobs[0].model,'cursor-default');
  assert.notEqual(poll.json.data.jobs[0].leaseToken,x.attempt.leaseToken);
  assert.equal((await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:x.attempt.attemptId,leaseToken:x.attempt.leaseToken,type:'log',message:'stale writer'}})).status,409);
+});
+
+test('removing a pending handoff target cancels safely after source stop acknowledgment',async t=>{
+ const x=await approvedRunning(t),keys=generateCheckpointKeys(),node=await req(x.f,'/api/v1/nodes',{method:'POST',...x.auth,body:{name:'Pending target',visibility:'private'}}),targetId=node.json.data.id;
+ const sourceId=(await x.f.db.query('SELECT node_id FROM connections WHERE id=$1',[x.source])).rows[0].node_id;
+ await req(x.f,`/api/v1/projects/${x.project}`,{method:'PATCH',...x.auth,body:{nodeIds:[sourceId,targetId]}});
+ await req(x.f,'/api/v1/worker/heartbeat',{method:'POST',token:node.json.data.token,body:{checkpointPublicKey:keys.publicKey,capabilities:{tools:[{tool:'cursor',models:[{id:'cursor-default',name:'Cursor',modes:['deep']}]}]}}});
+ const target=await req(x.f,'/api/v1/connections',{method:'POST',...x.auth,body:{name:'Pending target connection',nodeId:targetId,tool:'cursor',visibility:'private',projectIds:[x.project],model:'cursor-default',mode:'deep',allowedModels:['cursor-default'],allowOverride:true,maxConcurrency:1}});assert.equal(target.status,201);
+ assert.equal((await req(x.f,`/api/v1/tasks/${x.task}/transfer`,{method:'POST',...x.auth,body:{connectionId:target.json.data.id}})).status,202);
+ assert.equal((await req(x.f,`/api/v1/projects/${x.project}`,{method:'PATCH',...x.auth,body:{nodeIds:[sourceId]}})).status,200);
+ const cancellation=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{}})).json.data.cancellations[0];assert.equal(cancellation.reason,'cancel');assert.equal(cancellation.handoff,undefined);
+ const stopped=await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:cancellation.attemptId,leaseToken:x.attempt.leaseToken,type:'stopped',data:{}}});assert.equal(stopped.status,200,JSON.stringify(stopped.json));
+ assert.equal((await req(x.f,`/api/v1/tasks/${x.task}`,{cookie:x.auth.cookie})).json.data.status,'canceled');
+ assert.deepEqual((await req(x.f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{}})).json.data.jobs,[]);
 });
 
 test('project task visibility does not grant approval or transfer rights to a private connection',async t=>{
@@ -468,7 +517,7 @@ test('local Git projects require a paired private node and browser device, and s
   const boot = await req(f, '/api/v1/auth/bootstrap', {method:'POST', body:{organization:'Local',name:'Owner',email:'local@example.test',password:fixturePassword('local-device-password')}});
   const auth = {cookie:boot.headers.get('set-cookie').split(';')[0],csrf:boot.json.data.csrfToken};
   const device = randomBytes(32).toString('base64url'), otherDevice = randomBytes(32).toString('base64url');
-  const node = await req(f,'/api/v1/nodes',{method:'POST',...auth,device,body:{name:'My Mac',visibility:'private',projectIds:[]}});
+  const node = await req(f,'/api/v1/nodes',{method:'POST',...auth,device,body:{name:'My Mac',visibility:'private'}});
   assert.equal(node.status,201);
   const pairing = await req(f,`/api/v1/nodes/${node.json.data.id}/pairing`,{method:'POST',...auth,device,body:{}});
   assert.equal(pairing.status,201,JSON.stringify(pairing.json));
@@ -482,10 +531,9 @@ test('local Git projects require a paired private node and browser device, and s
   assert.equal(JSON.stringify(listed.json).includes('localDeviceHash'),false);
   const local = await req(f,'/api/v1/projects',{method:'POST',...auth,device,body:{name:'Local repo',repoType:'local',localPath:'/Users/owner/src/repo',localNodeId:node.json.data.id,baseBranch:'main',visibility:'private'}});
   assert.equal(local.status,201,JSON.stringify(local.json));
-  const localGrantRemoval=await req(f,`/api/v1/nodes/${node.json.data.id}`,{method:'PATCH',...auth,device,body:{projectIds:[]}});assert.equal(localGrantRemoval.status,400);
+  const localNodeRemoval=await req(f,`/api/v1/projects/${local.json.data.id}`,{method:'PATCH',...auth,device,body:{nodeIds:[]}});assert.equal(localNodeRemoval.status,200);assert.deepEqual(localNodeRemoval.json.data.nodeIds,[node.json.data.id]);
   assert.deepEqual({repoType:local.json.data.repoType,localPath:local.json.data.localPath,localNodeId:local.json.data.localNodeId,visibility:local.json.data.visibility},{repoType:'local',localPath:'/Users/owner/src/repo',localNodeId:node.json.data.id,visibility:'private'});
-  const grants = (await f.db.query('SELECT project_ids FROM nodes WHERE id=$1',[node.json.data.id])).rows[0].project_ids;
-  assert.ok((Array.isArray(grants)?grants:JSON.parse(grants)).includes(local.json.data.id),'local project binding grants the chosen node access');
+  assert.deepEqual(local.json.data.nodeIds,[node.json.data.id],'local project selects its paired node');
   const wrongDevice = await req(f,'/api/v1/projects',{method:'POST',...auth,device:otherDevice,body:{name:'Wrong browser',repoType:'local',localPath:'/tmp/repo',localNodeId:node.json.data.id,baseBranch:'main',visibility:'private'}});
   assert.equal(wrongDevice.status,403);
   const shared = await req(f,'/api/v1/projects',{method:'POST',...auth,device,body:{name:'Shared local',repoType:'local',localPath:'/tmp/repo',localNodeId:node.json.data.id,baseBranch:'main',visibility:'team',teamId:(await req(f,'/api/v1/teams',{...auth})).json.data[0]?.id}});
@@ -531,7 +579,7 @@ test('worker config manifest includes only current granted projects and never cr
  const x=await ownerFixture(t),connection=(await x.f.db.query('SELECT node_id FROM connections WHERE id=$1',[x.source])).rows[0];
  const manifest=await req(x.f,'/api/v1/worker/config',{method:'POST',token:x.token,body:{}});assert.equal(manifest.status,200,JSON.stringify(manifest.json));assert.equal(manifest.json.data.nodeId,connection.node_id);assert.deepEqual(manifest.json.data.projects.map(p=>p.id),[x.project]);
  const encoded=JSON.stringify(manifest.json);assert.equal(encoded.includes(x.token),false);assert.equal(encoded.includes('tokenHash'),false);assert.equal(encoded.includes('repoUrl'),false);
- await x.f.db.query('UPDATE nodes SET project_ids=\'[]\'::jsonb WHERE id=$1',[connection.node_id]);const empty=await req(x.f,'/api/v1/worker/config',{method:'POST',token:x.token,body:{}});assert.deepEqual(empty.json.data.projects,[]);
+ await x.f.db.query('UPDATE projects SET node_ids=\'[]\'::jsonb WHERE id=$1',[x.project]);const empty=await req(x.f,'/api/v1/worker/config',{method:'POST',token:x.token,body:{}});assert.deepEqual(empty.json.data.projects,[]);
 });
 
 test('workflow review requires child acceptance, blocks stale downstream rework, and reopens after leaf rework',async t=>{
@@ -550,35 +598,45 @@ test('workflow review requires child acceptance, blocks stale downstream rework,
  const parentAccepted=await req(x.f,`/api/v1/tasks/${parentId}/review`,{method:'POST',...x.auth,body:{decision:'accept',expectedGeneration:0}});assert.equal(parentAccepted.json.data?.status,'completed',JSON.stringify(parentAccepted.json));
 });
 
-test('node edit changes project grants and sharing without rotating credentials',async t=>{
+test('projects select execution nodes and node edit never changes project bindings or credentials',async t=>{
  const x=await ownerFixture(t),node=(await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie})).json.data[0];
  const second=await req(x.f,'/api/v1/projects',{method:'POST',...x.auth,body:{name:'Second repo',repoUrl:'https://github.com/team/second.git',baseBranch:'main',visibility:'private'}});assert.equal(second.status,201);
  const before=(await x.f.db.query('SELECT token_hash,project_ids FROM nodes WHERE id=$1',[node.id])).rows[0];
- const edited=await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{name:'Updated runner',projectIds:[x.project,second.json.data.id]}});assert.equal(edited.status,200,JSON.stringify(edited.json));assert.equal(edited.json.data.name,'Updated runner');assert.deepEqual(edited.json.data.projectIds,[x.project,second.json.data.id]);
- const after=(await x.f.db.query('SELECT token_hash FROM nodes WHERE id=$1',[node.id])).rows[0];assert.equal(after.token_hash,before.token_hash);assert.equal(JSON.stringify(edited.json).includes(x.token),false);
- const omitted=await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{name:'Still same grants'}});assert.equal(omitted.status,200);assert.deepEqual(omitted.json.data.projectIds,[x.project,second.json.data.id]);
+ const edited=await req(x.f,`/api/v1/projects/${second.json.data.id}`,{method:'PATCH',...x.auth,body:{nodeIds:[node.id]}});assert.equal(edited.status,200,JSON.stringify(edited.json));assert.deepEqual(edited.json.data.nodeIds,[node.id]);
+ const nodeEdit=await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{name:'Updated runner'}});assert.equal(nodeEdit.status,200,JSON.stringify(nodeEdit.json));assert.equal(nodeEdit.json.data.name,'Updated runner');assert.equal(Object.hasOwn(nodeEdit.json.data,'projectIds'),false);
+ const after=(await x.f.db.query('SELECT token_hash,project_ids FROM nodes WHERE id=$1',[node.id])).rows[0];assert.equal(after.token_hash,before.token_hash);assert.deepEqual(after.project_ids,[]);assert.equal(JSON.stringify(nodeEdit.json).includes(x.token),false);
+ const omitted=await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{name:'Still standalone'}});assert.equal(omitted.status,200);assert.deepEqual(edited.json.data.nodeIds,[node.id]);
  assert.equal((await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{ownerId:'other'}})).status,400);
  assert.equal((await req(x.f,'/api/v1/nodes/not-in-this-org',{method:'PATCH',...x.auth,body:{name:'Nope'}})).status,404);
  const member=await req(x.f,'/api/v1/members',{method:'POST',...x.auth,body:{name:'No edit',email:'node-edit@example.test',password:fixturePassword('node-edit-member-password')}}),login=await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:'node-edit@example.test',password:fixturePassword('node-edit-member-password')}}),memberAuth={cookie:login.headers.get('set-cookie').split(';')[0],csrf:login.json.data.csrfToken};
  assert.equal((await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...memberAuth,body:{name:'Impersonate'}})).status,403);
+ assert.equal((await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project]}})).status,400);
 });
 
-test('node grant revocation stops active work and cancels queued work until safe stop acknowledgment',async t=>{
+test('shared project responses do not reveal execution nodes hidden from the viewer',async t=>{
+ const x=await ownerFixture(t),node=(await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie})).json.data[0];
+ const member=await req(x.f,'/api/v1/members',{method:'POST',...x.auth,body:{name:'Project viewer',email:'node-scope@example.test',password:fixturePassword('node-scope-password')}});
+ const project=await req(x.f,'/api/v1/projects',{method:'POST',...x.auth,body:{name:'Shared project',repoUrl:'https://github.com/team/shared.git',baseBranch:'main',visibility:'custom',memberIds:[member.json.data.id],nodeIds:[node.id]}});assert.equal(project.status,201,JSON.stringify(project.json));
+ const login=await req(x.f,'/api/v1/auth/login',{method:'POST',body:{email:'node-scope@example.test',password:fixturePassword('node-scope-password')}}),cookie=login.headers.get('set-cookie').split(';')[0];
+ const projects=await req(x.f,'/api/v1/projects',{cookie});assert.deepEqual(projects.json.data.find(p=>p.id===project.json.data.id).nodeIds,[]);
+});
+
+test('removing a node from a project stops active work and cancels queued work until safe stop acknowledgment',async t=>{
  const x=await ownerFixture(t),node=(await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie})).json.data[0];
  const first=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Active task',description:'Stop safely',projectId:x.project,connectionId:x.source}}),second=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Queued task',description:'Cancel cleanly',projectId:x.project,connectionId:x.source}});
  const active=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:1}})).json.data.jobs[0];
- const edited=await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{projectIds:[]}});assert.equal(edited.status,200,JSON.stringify(edited.json));
+ const edited=await req(x.f,`/api/v1/projects/${x.project}`,{method:'PATCH',...x.auth,body:{nodeIds:[]}});assert.equal(edited.status,200,JSON.stringify(edited.json));
  assert.equal((await req(x.f,`/api/v1/tasks/${first.json.data.id}`,{cookie:x.auth.cookie})).json.data.status,'stopping');assert.equal((await req(x.f,`/api/v1/tasks/${second.json.data.id}`,{cookie:x.auth.cookie})).json.data.status,'canceled');
- const queuedEvent=(await req(x.f,`/api/v1/tasks/${second.json.data.id}`,{cookie:x.auth.cookie})).json.data.events.find(e=>e.type==='node_access_revoked');assert.ok(queuedEvent);
+ const queuedEvent=(await req(x.f,`/api/v1/tasks/${second.json.data.id}`,{cookie:x.auth.cookie})).json.data.events.find(e=>e.type==='project_node_revoked');assert.ok(queuedEvent);
  const cancellation=(await req(x.f,'/api/v1/worker/poll',{method:'POST',token:x.token,body:{capacity:0}})).json.data.cancellations[0];assert.equal(cancellation.taskId,first.json.data.id);
  const ack=await req(x.f,'/api/v1/worker/events',{method:'POST',token:x.token,body:{attemptId:active.attemptId,leaseToken:active.leaseToken,type:'stopped',data:{}}});assert.equal(ack.status,200,JSON.stringify(ack.json));assert.equal((await req(x.f,`/api/v1/tasks/${first.json.data.id}`,{cookie:x.auth.cookie})).json.data.status,'canceled');
 });
 
-test('connection edits add a second node project and refuse invalid or in-use grant removal',async t=>{
+test('connection edits use project-selected nodes and refuse invalid or in-use grant removal',async t=>{
  const x=await ownerFixture(t),nodes=(await req(x.f,'/api/v1/nodes',{cookie:x.auth.cookie})).json.data,node=nodes[0];
  const second=(await req(x.f,'/api/v1/projects',{method:'POST',...x.auth,body:{name:'Additional connection repo',repoUrl:'https://github.com/team/additional.git',baseBranch:'main',visibility:'private'}})).json.data;
- const initial=await req(x.f,`/api/v1/connections/${x.source}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project,second.id]}});assert.equal(initial.status,400,'node grant is required before connection grant');
- assert.equal((await req(x.f,`/api/v1/nodes/${node.id}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project,second.id]}})).status,200);
+ const initial=await req(x.f,`/api/v1/connections/${x.source}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project,second.id]}});assert.equal(initial.status,400,'project must select node before connection grant');
+ assert.equal((await req(x.f,`/api/v1/projects/${second.id}`,{method:'PATCH',...x.auth,body:{nodeIds:[node.id]}})).status,200);
  const edited=await req(x.f,`/api/v1/connections/${x.source}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project,second.id]}});assert.equal(edited.status,200,JSON.stringify(edited.json));assert.deepEqual(edited.json.data.projectIds,[x.project,second.id]);
  const queued=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Second repo task',description:'Verify the existing connection can run another project',projectId:second.id,connectionId:x.source}});assert.equal(queued.status,201,JSON.stringify(queued.json));
  const denied=await req(x.f,`/api/v1/connections/${x.source}`,{method:'PATCH',...x.auth,body:{projectIds:[x.project]}});assert.equal(denied.status,409);assert.equal(denied.json.error.code,'connection_projects_in_use');

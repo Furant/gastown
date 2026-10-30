@@ -35,8 +35,8 @@ The compose file publishes the console to server loopback only. Place it behind 
 
 ## Register an execution node
 
-1. Create a project in the console, specifying the repository URL and base branch.
-2. Register a node with its owner, visibility and permitted projects. Copy its token once; the server stores only its hash.
+1. Register a standalone node with its name and visibility. Copy its token once; the server stores only its hash.
+2. Create or edit a project and select its execution nodes. Several projects may use the same node; a remote project may select multiple nodes. A project with no nodes selected cannot execute tasks yet.
 3. On that machine, create a protected `node-config.json`, mapping the console project ID to a local repository:
 
 ```json
@@ -83,7 +83,7 @@ Execution preserves an isolated task worktree. The task detail shows its path, a
 
 ## Task lifecycle and sharing
 
-Connections and projects start private. Owners may separately share them with a team or explicit members. A user needs project, node and connection access; sharing a task alone grants no tool credentials. Configure a connection only after its node reports tool models. Models and reasoning modes are validated against the connection's catalog and owner restrictions. Attempts snapshot their configuration.
+Connections and projects start private. Owners may separately share them with a team or explicit members. Projects select execution nodes; nodes do not maintain project grants. A user needs project, selected node and connection access; sharing a task alone grants no tool credentials. Configure a connection only after its node reports tool models. Models and reasoning modes are validated against the connection's catalog and owner restrictions. Attempts snapshot their configuration.
 
 Creating a task queues a planning job. An execution node calls the selected CLI in planning mode. Review the returned plan and explicitly approve execution, commits/push and PR creation. No task receives merge authorization. Observe task events and errors in the task detail view.
 
@@ -131,7 +131,7 @@ For a decomposed workflow, review its children first; the parent can be accepted
 
 ## Synchronize an existing node configuration
 
-A node can serve multiple projects. Its owner can edit the existing node's name, sharing and project grants from the node list or detail view; editing preserves its ID, credentials and local pairing. A private local project bound to that node cannot be detached through node editing. Removing project access or narrowing sharing requests a safe stop for affected running work and cancels affected queued work; it does not transfer execution to another machine. Node grants and tool-connection grants are separate: authorize the added project on its tool connection as well, then synchronize the node's local repository mappings.
+A node can serve multiple projects. Its owner can edit the existing node's name and sharing from the node list or detail view; editing preserves its ID, credentials and local pairing. Manage execution-node selections only on the project page. A private local project retains its paired local node. Removing a project's selected node or narrowing node sharing requests a safe stop for affected running work and cancels affected queued work; it does not transfer execution to another machine. Tool connections still have independent project grants for account usage: authorize the project on its tool connection as well, then synchronize the node's local repository mappings. Existing node-side associations migrate once into project selections when upgrading.
 
 Copied node commands use the installation directory and configuration file path explicitly. Fill both absolute paths for the execution computer in the node setup or detail panel; these non-credential preferences are remembered separately for each account and node. The installation directory must be the `console/` folder containing `package.json`. The generated `npm --prefix` commands can run from any terminal directory, tighten configuration permissions to mode 0600, and prompt for a missing node token without echoing it. Pairing asks for its short-lived code separately. Do not point a real node at disposable smoke-test configuration files or service URLs.
 

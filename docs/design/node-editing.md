@@ -1,3 +1,7 @@
+# Superseded relationship configuration
+
+Project/node relationship configuration is superseded by [project-owned execution node selection](project-node-selection.md). Node editing now covers name and sharing only. The historical implementation below describes the former bidirectional UI.
+
 # Execution node editing
 
 User request: existing nodes must be editable and support multiple projects. Continue the cwd-independent command fix concurrently; do not rotate node credentials or create a replacement node.

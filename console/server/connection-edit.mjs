@@ -40,7 +40,7 @@ export async function editConnection(db, user, id, body, modelMapping) {
     for (const projectId of next.projectIds) {
       const project = (await tx.query('SELECT * FROM projects WHERE id=$1 AND org_id=$2', [projectId, actor.org_id])).rows[0];
       if (!project || !inScope(project, actor, teams) || !inScope(project, owner, ownerTeams)) denied();
-      if (!asArray(node.project_ids).includes(projectId)) fail(400, 'node_project_grant_required', 'The execution node must be granted each connection project');
+      if (!asArray(project.node_ids).includes(node.id)) fail(400, 'project_node_required', 'The project must select this execution node before granting its tool connection');
       await requireLocalExecutionNode(tx, { ...actor, local_device_hash: user.local_device_hash }, project, node);
       if (project.repo_type === 'local' && (next.allowAutoFailover || current.visibility !== 'private')) invalid('Local project connections must stay private and cannot enable automatic failover');
     }

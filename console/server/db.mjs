@@ -16,6 +16,8 @@ const schema = [
 `ALTER TABLE projects ADD COLUMN IF NOT EXISTS repo_type TEXT NOT NULL DEFAULT 'remote'`,
 `ALTER TABLE projects ADD COLUMN IF NOT EXISTS local_path TEXT`,
 `ALTER TABLE projects ADD COLUMN IF NOT EXISTS local_node_id TEXT`,
+`ALTER TABLE projects ADD COLUMN IF NOT EXISTS node_ids JSONB NOT NULL DEFAULT '[]'`,
+`CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY,applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
 `CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY,org_id TEXT NOT NULL REFERENCES orgs(id),owner_id TEXT NOT NULL REFERENCES users(id),name TEXT NOT NULL,visibility TEXT NOT NULL,team_id TEXT,member_ids JSONB NOT NULL DEFAULT '[]',project_ids JSONB NOT NULL DEFAULT '[]',token_hash TEXT NOT NULL UNIQUE,capabilities JSONB NOT NULL DEFAULT '{"tools":[]}',online_at TIMESTAMPTZ,revoked_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
 `ALTER TABLE nodes ADD COLUMN IF NOT EXISTS local_device_hash TEXT`,
 `CREATE TABLE IF NOT EXISTS local_pairings(id TEXT PRIMARY KEY,org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,device_hash TEXT NOT NULL,code_hash TEXT NOT NULL UNIQUE,expires_at TIMESTAMPTZ NOT NULL,consumed_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
@@ -96,5 +98,15 @@ export async function createDatabase({ connectionString, dataDir = '.data' } = {
     } finally { client.release(); }
   };
   for (const sql of schema) await query(sql);
+  await transaction(async tx => {
+    const inserted = await tx.query("INSERT INTO schema_migrations(version) VALUES('project-node-selection-v1') ON CONFLICT DO NOTHING RETURNING version");
+    if (inserted.rows.length) {
+      const legacy = (await tx.query("SELECT id,org_id,project_ids FROM nodes WHERE project_ids<>'[]'::jsonb")).rows;
+      for (const node of legacy) for (const projectId of (typeof node.project_ids === 'string' ? JSON.parse(node.project_ids) : node.project_ids)) {
+        await tx.query("UPDATE projects SET node_ids=CASE WHEN repo_type='local' THEN jsonb_build_array(local_node_id) WHEN node_ids ? $3 THEN node_ids ELSE node_ids || to_jsonb($3::text) END WHERE id=$1 AND org_id=$2", [projectId, node.org_id, node.id]);
+      }
+      await tx.query("UPDATE nodes SET project_ids='[]'::jsonb WHERE project_ids<>'[]'::jsonb");
+    }
+  });
   return { query, transaction, close: () => raw.close ? raw.close() : raw.end(), embedded };
 }

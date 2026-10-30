@@ -59,9 +59,9 @@ console.log(JSON.stringify({type:'result',result:'Cross-node continuation verifi
     app.closeAllConnections(); await new Promise(resolve => app.close(resolve)); await db.close();
     await rm(dir, { recursive: true, force: true });
   });
-  async function api(path, body) {
+  async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
     const response = await fetch(base + '/api/v1' + path, {
-      method: body === undefined ? 'GET' : 'POST',
+      method,
       headers: { 'content-type': 'application/json', origin: base, ...(cookie ? { cookie, 'x-csrf-token': csrf } : {}) },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -77,12 +77,13 @@ console.log(JSON.stringify({type:'result',result:'Cross-node continuation verifi
     { tool: 'cursor', models: [{ id: 'fixture-cursor', name: 'Fixture Cursor', modes: ['high'], nativeByMode: { high: 'fixture-cursor-high' } }] },
   ] };
   async function register(name) {
-    const node = (await api('/nodes', { name, visibility: 'private', projectIds: [project.id] })).data;
+    const node = (await api('/nodes', { name, visibility: 'private' })).data;
     const keys = generateCheckpointKeys(), client = new WorkerClient({ serverUrl: base, token: node.token });
     await client.heartbeat(caps, keys.publicKey);
     return { node, keys, client };
   }
   const source = await register('Source machine'), target = await register('Target machine');
+  await api('/projects/'+project.id,{nodeIds:[source.node.id,target.node.id]},'PATCH');
   async function connection(node, tool, model) {
     return (await api('/connections', { name: tool, nodeId: node.id, tool, visibility: 'private', projectIds: [project.id], model, mode: 'high', allowedModels: [model], allowOverride: true, maxConcurrency: 1 })).data;
   }

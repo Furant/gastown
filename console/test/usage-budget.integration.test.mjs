@@ -42,7 +42,8 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   const boot = await api('/auth/bootstrap', { organization: 'Usage fixture', name: 'Fixture owner', email: 'usage-owner@example.test', password: randomBytes(24).toString('hex') });
   cookie = boot.headers.get('set-cookie').split(';')[0]; csrf = boot.data.csrfToken;
   const project = (await api('/projects', { name: 'Usage fixture repo', repoUrl: 'https://github.com/fixture/usage.git', baseBranch: 'main', visibility: 'private' })).data;
-  const node = (await api('/nodes', { name: 'Fixture node', visibility: 'private', projectIds: [project.id] })).data;
+  const node = (await api('/nodes', { name: 'Fixture node', visibility: 'private' })).data;
+  await api('/projects/'+project.id, {nodeIds:[node.id]}, 'PATCH');
   const caps = { tools: [{ tool: 'codex', models: [{ id: 'fixture-codex', name: 'Fixture Codex', modes: ['high'], nativeByMode: { high: 'fixture-codex' } }] }] };
   const client = new WorkerClient({ serverUrl: base, token: node.token }); await client.heartbeat(caps);
   const connection = (await api('/connections', { name: 'Fixture Codex', nodeId: node.id, tool: 'codex', visibility: 'private', projectIds: [project.id], model: 'fixture-codex', mode: 'high', allowedModels: ['fixture-codex'], allowOverride: true, maxConcurrency: 1 })).data;

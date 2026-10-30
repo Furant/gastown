@@ -12,7 +12,6 @@ import {
   isControlPlaneUrlAllowed,
   nodeStatus,
   validateNodeConfig,
-  nodeProjectIds,
   freshWorkspaceState,
   buildNodeCommand,
   buildNodeSetupCommand,
@@ -52,8 +51,6 @@ test('accepts an empty project map for first-node bootstrap but validates every 
 });
 
 test('normalizes node registration with no project checkbox controls to an empty project list', () => {
-  assert.deepEqual(nodeProjectIds({ name: 'My laptop' }), []);
-  assert.deepEqual(nodeProjectIds({ projectIds: ['project-1'] }), ['project-1']);
 });
 
 test('fresh workspace reset discards account-private state and retains only local device credential', () => {

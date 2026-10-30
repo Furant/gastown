@@ -60,7 +60,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   cookie = boot.headers.get('set-cookie').split(';')[0]; csrf = boot.data.csrfToken;
 
   // Start with the exact state that caused the onboarding dead end: no projects are mapped yet.
-  const node = (await api('/nodes', { name: 'This computer', visibility: 'private', projectIds: [] })).data;
+  const node = (await api('/nodes', { name: 'This computer', visibility: 'private' })).data;
   const token = node.token;
   const config = { serverUrl: base, projects: {}, worktreesDir, tools: { codex: { command: fixtureCli } }, preservedSetting: 'keep-me' };
   await writeFile(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
@@ -103,7 +103,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
 
   const caps = { tools: [{ tool: 'codex', models: [{ id: 'fixture-codex', name: 'Fixture Codex', modes: ['high'], nativeByMode: { high: 'fixture-codex' } }] }] };
   const client = new WorkerClient({ serverUrl: base, token });
-  const foreign = (await api('/nodes', { name: 'Unpaired other computer', visibility: 'private', projectIds: [project.id] })).data;
+  const foreign = (await api('/nodes', { name: 'Unpaired other computer', visibility: 'private' })).data;
   const foreignClient = new WorkerClient({ serverUrl: base, token: foreign.token }); await foreignClient.heartbeat(caps);
   const connection = (await api('/connections', { name: 'Fixture Codex', nodeId: node.id, tool: 'codex', visibility: 'private', projectIds: [project.id], model: 'fixture-codex', mode: 'high', allowedModels: ['fixture-codex'], allowOverride: true, maxConcurrency: 1 })).data;
   const task = (await api('/tasks', { title: 'Run a first local task', description: 'Update the fixture README and leave it for local review.', projectId: project.id, connectionId: connection.id })).data;
@@ -113,7 +113,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   assert.ok(planJob); assert.equal(planJob.repoType, 'local'); assert.equal(planJob.localNodeId, node.id); assert.equal(planJob.localPath, repo);
   await runner.run(planJob);
   await api(`/tasks/${task.id}/approve`, { allowPush: false, allowPR: false });
-  assert.equal((await foreignClient.poll({ capacity: 1 })).jobs.length, 0, 'unpaired node cannot claim a task even when it has the project grant');
+  assert.equal((await foreignClient.poll({ capacity: 1 })).jobs.length, 0, 'unselected unpaired node cannot claim a local task');
   await runner.run((await client.poll({ capacity: 1 })).jobs[0]);
   const detail = (await api(`/tasks/${task.id}`)).data;
   assert.equal(detail.status, 'awaiting_review');

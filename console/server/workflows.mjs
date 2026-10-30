@@ -76,8 +76,8 @@ export async function decomposeTask(db, user, parent, children, access) {
   for (const key of byKey.keys()) visit(key);
   const teams = await access.teamsFor(user), ids = new Map();
   for (const child of children) {
-    const c = (await db.query('SELECT c.*,n.project_ids AS node_project_ids,n.revoked_at AS node_revoked,n.owner_id AS node_owner_id,n.visibility AS node_visibility,n.team_id AS node_team_id,n.member_ids AS node_member_ids FROM connections c JOIN nodes n ON n.id=c.node_id WHERE c.id=$1 AND c.org_id=$2 AND c.revoked_at IS NULL', [child.connectionId, user.org_id])).rows[0];
-    if (!c || c.node_revoked || !arr(c.project_ids).includes(parent.project_id) || !arr(c.node_project_ids).includes(parent.project_id)) fail(403, 'task_connection_not_allowed', 'A selected connection cannot access this project');
+    const c = (await db.query('SELECT c.*,p.node_ids AS project_node_ids,n.revoked_at AS node_revoked,n.owner_id AS node_owner_id,n.visibility AS node_visibility,n.team_id AS node_team_id,n.member_ids AS node_member_ids FROM connections c JOIN nodes n ON n.id=c.node_id JOIN projects p ON p.id=$3 WHERE c.id=$1 AND c.org_id=$2 AND c.revoked_at IS NULL', [child.connectionId, user.org_id, parent.project_id])).rows[0];
+    if (!c || c.node_revoked || !arr(c.project_ids).includes(parent.project_id) || !arr(c.project_node_ids).includes(c.node_id)) fail(403, 'task_connection_not_allowed', 'A selected connection cannot access this project');
     access.allowed(user, c, teams);
     access.allowed(user, {id:c.node_id,org_id:c.org_id,owner_id:c.node_owner_id,visibility:c.node_visibility,team_id:c.node_team_id,member_ids:c.node_member_ids}, teams);
     const caps = (await db.query('SELECT capabilities FROM nodes WHERE id=$1', [c.node_id])).rows[0]?.capabilities;
