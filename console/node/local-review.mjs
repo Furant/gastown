@@ -90,7 +90,7 @@ function prefixByBytes(value, limit) {
   return prefix;
 }
 
-export async function collectLocalReview({ worktreePath, project } = {}) {
+export async function collectLocalReview({ worktreePath, project, workspaceMode } = {}) {
   if (typeof worktreePath !== 'string' || !path.isAbsolute(worktreePath) || Buffer.byteLength(worktreePath) > MAX_WORKTREE_PATH) throw new Error('Invalid local task worktree path');
   const root = await fs.realpath(worktreePath).catch(() => { throw new Error('Local task worktree is unavailable'); });
   if (!(await fs.stat(root)).isDirectory()) throw new Error('Invalid local task worktree');
@@ -133,7 +133,7 @@ export async function collectLocalReview({ worktreePath, project } = {}) {
     if (bounded.truncated) { diffTruncated = true; break; }
   }
   let filesTruncated = safeStatus.length !== status.length || safeStatus.length > MAX_FILES || safeStatus.some(file => Buffer.byteLength(file.path) > MAX_FILE_PATH);
-  const result = { worktreePath: root, files: visible.map(({ sourcePath, ...file }) => file), diff, diffTruncated, filesTruncated };
+  const result = { worktreePath: root, ...(workspaceMode ? { workspaceMode } : {}), ...(workspaceMode === 'in_place' ? { note: 'Review includes changes in the configured project directory, including pre-existing edits.' } : {}), files: visible.map(({ sourcePath, ...file }) => file), diff, diffTruncated, filesTruncated };
   while (Buffer.byteLength(JSON.stringify(result)) > MAX_REVIEW_BYTES && result.diff.length) {
     const nextLength = Math.floor(result.diff.length * 0.75);
     result.diff = prefixByBytes(result.diff, nextLength);

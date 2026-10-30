@@ -119,6 +119,17 @@ async function ownerFixture(t) {
   return {f,auth,token,project:project.json.data.id,source:source.json.data.id,target:target.json.data.id};
 }
 
+test('new remote tasks always use worktree mode regardless of client input',async t=>{
+ const x=await ownerFixture(t);
+ const created=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Remote workspace',description:'Use isolated checkout',projectId:x.project,connectionId:x.source,workspaceMode:'in_place'}});
+ assert.equal(created.status,201,JSON.stringify(created.json));
+ assert.equal(created.json.data.workspaceMode,'worktree');
+ const stored=(await x.f.db.query('SELECT workspace_mode FROM tasks WHERE id=$1',[created.json.data.id])).rows[0];
+ assert.equal(stored.workspace_mode,'worktree');
+ const migration=(await x.f.db.query("SELECT column_default,is_nullable FROM information_schema.columns WHERE table_name='tasks' AND column_name='workspace_mode'")).rows[0];
+ assert.match(migration.column_default,/worktree/);assert.equal(migration.is_nullable,'NO');
+});
+
 async function approvedRunning(t) {
   const x=await ownerFixture(t);
   const made=await req(x.f,'/api/v1/tasks',{method:'POST',...x.auth,body:{title:'Implement feature',description:'Add a feature with tests',projectId:x.project,connectionId:x.source}});
@@ -535,6 +546,8 @@ test('static web modules use a JavaScript MIME type with nosniff enabled',async 
 test('local Git projects require a paired private node and browser device, and stay bound to that node', async t => {
   assert.throws(() => validateLocalReview({worktreePath:'file:///tmp/task',files:[],diff:'',diffTruncated:false,filesTruncated:false}));
   assert.throws(() => validateLocalReview({worktreePath:'/tmp/task\nfile:///etc/passwd',files:[],diff:'',diffTruncated:false,filesTruncated:false}));
+  assert.throws(() => validateLocalReview({worktreePath:'/tmp/task',workspaceMode:'elsewhere',files:[],diff:'',diffTruncated:false,filesTruncated:false}));
+  assert.equal(validateLocalReview({worktreePath:'/tmp/task',workspaceMode:'in_place',files:[],diff:'',diffTruncated:false,filesTruncated:false}).workspaceMode,'in_place');
   const f = await fixture(); t.after(f.close);
   const boot = await req(f, '/api/v1/auth/bootstrap', {method:'POST', body:{organization:'Local',name:'Owner',email:'local@example.test',password:fixturePassword('local-device-password')}});
   const auth = {cookie:boot.headers.get('set-cookie').split(';')[0],csrf:boot.json.data.csrfToken};
@@ -570,17 +583,28 @@ test('local Git projects require a paired private node and browser device, and s
   const safeConnection=await req(f,'/api/v1/connections',{method:'POST',...auth,device,body:{name:'Local Codex',nodeId:node.json.data.id,tool:'codex',visibility:'private',projectIds:[local.json.data.id],model:'local-model',mode:'high',allowedModels:['local-model'],allowOverride:false,maxConcurrency:1}});
   assert.equal(safeConnection.status,201,JSON.stringify(safeConnection.json));
   const task=await req(f,'/api/v1/tasks',{method:'POST',...auth,device,body:{title:'Review local change',description:'Keep the task on this computer',projectId:local.json.data.id,connectionId:safeConnection.json.data.id}});
-  assert.equal(task.status,201,JSON.stringify(task.json));
+  assert.equal(task.status,201,JSON.stringify(task.json));assert.equal(task.json.data.workspaceMode,'in_place');
   const plan=await req(f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{capacity:1}});
-  assert.equal(plan.json.data.jobs[0].repoType,'local');assert.equal(plan.json.data.jobs[0].localPath,'/Users/owner/src/repo');assert.equal(plan.json.data.jobs[0].localNodeId,node.json.data.id);assert.equal(plan.json.data.jobs[0].allowPush,false);assert.equal(plan.json.data.jobs[0].allowPR,false);
+  assert.equal(plan.json.data.jobs[0].repoType,'local');assert.equal(plan.json.data.jobs[0].workspaceMode,'in_place');assert.equal(plan.json.data.jobs[0].localPath,'/Users/owner/src/repo');assert.equal(plan.json.data.jobs[0].localNodeId,node.json.data.id);assert.equal(plan.json.data.jobs[0].allowPush,false);assert.equal(plan.json.data.jobs[0].allowPR,false);
   const job=plan.json.data.jobs[0];
+  const nextPlanTask=await req(f,'/api/v1/tasks',{method:'POST',...auth,device,body:{title:'Next local plan',description:'Wait until current branch preparation finishes',projectId:local.json.data.id,connectionId:safeConnection.json.data.id}});
+  const blockedDuringPlanning=await req(f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{capacity:1}});
+  assert.equal(blockedDuringPlanning.json.data.jobs.length,0,'same directory stays reserved while a task is planning');
   await req(f,'/api/v1/worker/events',{method:'POST',token:node.json.data.token,body:{attemptId:job.attemptId,leaseToken:job.leaseToken,type:'plan_ready',message:'plan',data:{summary:'review',steps:[{title:'Implement','acceptance':'Review'}]}}});
+  const nextPlan=(await req(f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{capacity:1}})).json.data.jobs[0];
+  assert.equal(nextPlan.taskId,nextPlanTask.json.data.id,'directory becomes claimable after planning finishes');
+  await req(f,'/api/v1/worker/events',{method:'POST',token:node.json.data.token,body:{attemptId:nextPlan.attemptId,leaseToken:nextPlan.leaseToken,type:'plan_ready',message:'plan',data:{summary:'review',steps:[{title:'Implement','acceptance':'Review'}]}}});
   const deniedDelivery=await req(f,`/api/v1/tasks/${task.json.data.id}/approve`,{method:'POST',...auth,device,body:{allowPush:true,allowPR:false}});assert.equal(deniedDelivery.status,400);
   await req(f,`/api/v1/tasks/${task.json.data.id}/approve`,{method:'POST',...auth,device,body:{allowPush:false,allowPR:false}});
   const execute=(await req(f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{capacity:1}})).json.data.jobs[0];assert.equal(execute.kind,'execute');
-  const localReview={worktreePath:'/Users/owner/.gastown-console/worktrees/repo/task',files:[{path:'src/app.js',status:'modified'}],diff:'diff --git a/src/app.js b/src/app.js\n+change',diffTruncated:false,filesTruncated:false};
+  await f.db.query('UPDATE connections SET max_concurrency=2 WHERE id=$1',[safeConnection.json.data.id]);
+  const sameDirectory=await req(f,'/api/v1/tasks',{method:'POST',...auth,device,body:{title:'Second local change',description:'Wait for the first writer',projectId:local.json.data.id,connectionId:safeConnection.json.data.id}});
+  assert.equal(sameDirectory.json.data.workspaceMode,'in_place');
+  const blockedByDirectory=await req(f,'/api/v1/worker/poll',{method:'POST',token:node.json.data.token,body:{capacity:1}});
+  assert.equal(blockedByDirectory.json.data.jobs.length,0,'same local directory has only one active writer even across tasks');
+  const localReview={worktreePath:'/Users/owner/src/repo',workspaceMode:'in_place',files:[{path:'src/app.js',status:'modified'}],diff:'diff --git a/src/app.js b/src/app.js\n+change',diffTruncated:false,filesTruncated:false};
   await req(f,'/api/v1/worker/events',{method:'POST',token:node.json.data.token,body:{attemptId:execute.attemptId,leaseToken:execute.leaseToken,type:'completed',message:'done',data:{branch:'console/task-1',summary:'Updated app',localReview}}});
-  const detail=await req(f,`/api/v1/tasks/${task.json.data.id}`,{...auth,device});assert.equal(detail.status,200);assert.equal(detail.json.data.localReview.diff,localReview.diff);assert.equal(detail.json.data.result.localReview,undefined);
+  const detail=await req(f,`/api/v1/tasks/${task.json.data.id}`,{...auth,device});assert.equal(detail.status,200);assert.equal(detail.json.data.localReview.diff,localReview.diff);assert.equal(detail.json.data.localReview.workspaceMode,'in_place');assert.equal(detail.json.data.result.localReview,undefined);
   const privateDetail=await req(f,`/api/v1/tasks/${task.json.data.id}`,{...auth,device:otherDevice});assert.equal(privateDetail.status,403);
   const transfer=await req(f,`/api/v1/tasks/${task.json.data.id}/transfer`,{method:'POST',...auth,device,body:{connectionId:safeConnection.json.data.id}});assert.equal(transfer.status,409);
 });

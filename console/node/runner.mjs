@@ -4,12 +4,13 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { buildInvocation, parsePlan } from './tools.mjs';
-import { ensureWorktree, makeCheckpoint, resolveProject } from './workspace.mjs';
+import { ensureWorktree, ensureInPlaceWorkspace, makeCheckpoint, resolveProject } from './workspace.mjs';
 import { exportCheckpoint, importCheckpoint, hasCheckpointState } from './checkpoint.mjs';
 import { randomUUID, createHash } from 'node:crypto';
 import { identifyProcess, writeJournal, recoverJournals, readJournal } from './journal.mjs';
 import { collectLocalReview } from './local-review.mjs';
 import { sanitizeOutput } from './output.mjs';
+import { acquireInPlaceLock } from './in-place-lock.mjs';
 
 const OUTPUT_LIMIT=256*1024, LINE_LIMIT=32*1024, LOG_LIMIT=3500;
 const execFileAsync=promisify(execFile);
@@ -55,9 +56,10 @@ export function makePrompt(job) {
   const dependencies=Array.isArray(dependencyList)?dependencyList.map(dep=>({title:dep.title,summary:dep.summary,branch:dep.branch,prUrl:dep.prUrl,status:dep.status})):[];
   const parentPlan=job.parentPlan&&Array.isArray(job.parentPlan.steps)?job.parentPlan.steps.slice(0,12).map(step=>({title:step.title,acceptance:step.acceptance})):[];
   const feedback=typeof job.reviewFeedback==='string'?job.reviewFeedback.trim().slice(0,4000):'';
+  const inPlace=job.repoType==='local'&&job.workspaceMode==='in_place';
   return [
-    'Implement only the human-approved task plan below in this isolated worktree.',
-    'Preserve existing project instructions and unrelated changes. Never switch branches, clean the worktree, amend commits or modify the default branch.',
+    inPlace?'Implement only the human-approved task plan in the configured original project directory.':'Implement only the human-approved task plan below in this isolated worktree.',
+    inPlace?'Preserve all existing staged, unstaged, and untracked changes, including unrelated edits. Do not clean, reset, stash, commit, or push.':'Preserve existing project instructions and unrelated changes. Never switch branches, clean the worktree, amend commits or modify the default branch.',
     'Run relevant tests and report factual results and remaining issues.',
     'Task: '+job.title,'Request: '+job.description,'Approved plan:\n'+steps,
     ...(parentPlan.length?['Accepted parent plan (scope boundary; implement only this child assignment):\n'+JSON.stringify(parentPlan)]:[]),
@@ -109,7 +111,11 @@ export class AgentRunner {
       await this.validateLocalProject(job,project);
       const invocation=buildInvocation({...job,prompt:makePrompt(job)},{...this.config,capabilities:this.capabilities});
       const remoteCheckpoint=job.checkpoint?.checkpointId?job.checkpoint:undefined;
-      const worktree=await this.ensureWorktree(project,job.taskId,remoteCheckpoint?{mustBeNew:true,allowExistingCheckpoint:true}:undefined);this.assertCanLaunch();this.assertNotCancelled(state);
+      const direct=job.repoType==='local'&&job.workspaceMode==='in_place';
+      const journal={attemptId:job.attemptId,taskId:job.taskId,leaseToken:job.leaseToken,phase:'preparing',tool:job.tool,createdAt:new Date().toISOString()};
+      if(this.journaling)await writeJournal(this.config,journal);
+      if(direct)state.releaseInPlace=await acquireInPlaceLock({project,config:this.config,attemptId:job.attemptId,assertWaitAllowed:()=>{this.assertCanLaunch();this.assertNotCancelled(state)}});
+      const worktree=direct?await ensureInPlaceWorkspace(project,job.baseBranch):await this.ensureWorktree(project,job.taskId,remoteCheckpoint?{mustBeNew:true,allowExistingCheckpoint:true}:undefined);this.assertCanLaunch();this.assertNotCancelled(state);
       state.worktree=worktree;
       if(remoteCheckpoint){
         if(!this.checkpointKeys?.privateKey)throw new Error('Node checkpoint private key is unavailable');
@@ -125,13 +131,12 @@ export class AgentRunner {
       this.assertCanLaunch();this.assertNotCancelled(state);
       invocation.cwd=worktree.path;
       const childEnv=providerEnvironment(process.env);
-      const journal={attemptId:job.attemptId,taskId:job.taskId,leaseToken:job.leaseToken,phase:'preparing',tool:job.tool,createdAt:new Date().toISOString()};
-      if(this.journaling)await writeJournal(this.config,journal);
       const marker=randomUUID();
       const launchEnv={...childEnv,GIT_TERMINAL_PROMPT:'0',CI:'1'};
       const child=this.journaling&&process.platform!=='win32'
         ?this.spawnImpl(process.execPath,[new URL('./supervisor.mjs',import.meta.url).pathname,marker],{cwd:invocation.cwd,env:{...launchEnv,GT_NODE_CONFIG_JSON:JSON.stringify({configPath:this.config.configPath,worktreesDir:this.config.worktreesDir,nodeId:this.config.nodeId}),GT_NODE_INVOCATION_JSON:JSON.stringify({...invocation,env:launchEnv}),GT_NODE_RECORD_JSON:JSON.stringify(journal)},shell:false,detached:true,windowsHide:true,stdio:['ignore','pipe','pipe']})
         :this.spawnImpl(invocation.command,invocation.args,{cwd:invocation.cwd,env:launchEnv,shell:false,detached:process.platform!=='win32',windowsHide:true,stdio:['ignore','pipe','pipe']});
+      state.inPlaceStarted=Boolean(state.releaseInPlace);
       state.journal=journal;if(state.cancelRequested){journal.stopIntent={reason:state.cancelRequested.reason};await writeJournal(this.config,journal)}
       session={job,project,worktree,child,output:'',pendingLine:'',stopping:false,terminalState:'running',eventPromises:[],usageSequence:0,state};
       this.running.set(job.attemptId,session);
@@ -170,7 +175,7 @@ export class AgentRunner {
       session.terminalState='completing';
       const prUrl=job.allowPR?await this.verifyPullRequest(worktree):undefined;
       if(session.stopping)throw new Error('Task execution was stopped before completion');
-      const localReview=job.repoType==='local'?await collectLocalReview({worktreePath:worktree.path,project}):undefined;
+      const localReview=job.repoType==='local'?await collectLocalReview({worktreePath:worktree.path,project,workspaceMode:worktree.mode}):undefined;
       try{await this.emit(session,'completed',prUrl?`Pull request created: ${prUrl}`:output.slice(0,8000)||'Task process completed',{branch:checkpoint.branch,summary:output.slice(0,8000),...(prUrl?{prUrl}:{}),...(localReview?{localReview}:{})})}
       catch(error){if(error.status===409&&error.code==='stale_attempt'){session.keepForStop=true;session.terminalState='awaiting_stop'}throw error}
       session.terminalState='completed';
@@ -192,7 +197,7 @@ export class AgentRunner {
         }
         await this.client.event({attemptId:job.attemptId,leaseToken:job.leaseToken,type:'stopped',message:'Attempt stopped before execution; cancellation acknowledged',data:{reason:state.cancelRequested.reason,...(data?{checkpoint:data}:{})}}).catch(()=>{});
       } else if(!alreadyReported&&safeToReport){
-        if(session)await this.emit(session,'failed',error.message).catch(()=>{});
+        if(session){try{await this.emit(session,'failed',error.message);session.journalTerminal=true}catch{}}
         else await this.client.event({attemptId:job?.attemptId,leaseToken:job?.leaseToken,type:'failed',message:sanitizeOutput(error.message)}).catch(()=>{});
       }
       if(this.journaling&&!session)await writeJournal(this.config,{attemptId:job?.attemptId,taskId:job?.taskId,phase:'terminal',finishedAt:new Date().toISOString()}).catch(()=>{});
@@ -206,6 +211,10 @@ export class AgentRunner {
         if(session.processGroupStopped&&!session.keepForStop){this.running.delete(session.job.attemptId);if(this.taskAttempts.get(session.job.taskId)===session.job.attemptId)this.taskAttempts.delete(session.job.taskId)}
       } else if(this.taskAttempts.get(job?.taskId)===job?.attemptId)this.taskAttempts.delete(job.taskId);
       if(!session?.keepForStop)this.pending.delete(job.attemptId);state.doneResolve();
+      if(state.releaseInPlace&&((session?.processGroupStopped&&session?.journalTerminal&&!session.keepForStop)||(!state.inPlaceStarted&&!session))){
+        if(this.journaling&&!session)await writeJournal(this.config,{attemptId:job.attemptId,taskId:job.taskId,phase:'terminal',finishedAt:new Date().toISOString()}).catch(()=>{});
+        try{await state.releaseInPlace();state.inPlaceReleased=true}catch(error){this.logger.error('in-place repository lock release failed',sanitizeOutput(error.message))}
+      }
     }
   }
   validate(job){
@@ -293,7 +302,14 @@ export class AgentRunner {
       await this.client.event({attemptId,leaseToken:session.job.leaseToken,type:'stopped',message:'Source process stopped; worktree checkpoint recorded',data:{reason:cancellation?.reason||'cancel',...(checkpoint?{checkpoint}:{}),...(cancellation?.handoff?.transferId?{transferId:cancellation.handoff.transferId}:{})}});
       session.journalTerminal=true;
       session.terminalState='stopped';
-      if(session.state.runSettled){this.running.delete(attemptId);this.pending.delete(attemptId);if(this.taskAttempts.get(session.job.taskId)===attemptId)this.taskAttempts.delete(session.job.taskId)}
+      session.keepForStop=false;
+      if(session.state.runSettled){
+        if(session.state.releaseInPlace&&!session.state.inPlaceReleased){
+          if(this.journaling)await writeJournal(this.config,{attemptId:session.job.attemptId,taskId:session.job.taskId,phase:'terminal',finishedAt:new Date().toISOString()});
+          await session.state.releaseInPlace();session.state.inPlaceReleased=true;
+        }
+        this.running.delete(attemptId);this.pending.delete(attemptId);if(this.taskAttempts.get(session.job.taskId)===attemptId)this.taskAttempts.delete(session.job.taskId)
+      }
       return {stopped:true,checkpoint};
     })().catch(error=>{session.stopPromise=null;throw error});
     return session.stopPromise;

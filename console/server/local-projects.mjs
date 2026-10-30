@@ -52,11 +52,12 @@ export async function requireLocalExecutionNode(db, user, project, node) {
 
 export function validateLocalReview(value) {
   const worktreePath = value?.worktreePath;
+  const workspaceMode = value?.workspaceMode;
   const absoluteWorktree = typeof worktreePath === 'string' && (worktreePath.startsWith('/') && !worktreePath.startsWith('//') || /^[A-Za-z]:[\\/]/.test(worktreePath));
-  if (!value || typeof value !== 'object' || Array.isArray(value) || !absoluteWorktree || worktreePath.length > 2048 || /[\0\r\n]/.test(worktreePath) || !Array.isArray(value.files) || value.files.length > 32 || typeof value.diff !== 'string' || value.diff.length > 12000 || Buffer.byteLength(value.diff) > 24000 || typeof value.diffTruncated !== 'boolean' || typeof value.filesTruncated !== 'boolean') invalid('Local review evidence exceeds its limits');
+  if (!value || typeof value !== 'object' || Array.isArray(value) || workspaceMode !== undefined && !['in_place','worktree'].includes(workspaceMode) || !absoluteWorktree || worktreePath.length > 2048 || /[\0\r\n]/.test(worktreePath) || !Array.isArray(value.files) || value.files.length > 32 || typeof value.diff !== 'string' || value.diff.length > 12000 || Buffer.byteLength(value.diff) > 24000 || typeof value.diffTruncated !== 'boolean' || typeof value.filesTruncated !== 'boolean') invalid('Local review evidence exceeds its limits');
   for (const file of value.files) {
     if (!file || typeof file.path !== 'string' || !file.path || file.path.length > 240 || /[\0\r\n]/.test(file.path) || file.path.startsWith('/') || file.path.split(/[\\/]/).includes('..') || !['added','modified','deleted','renamed','untracked'].includes(file.status)) invalid('Local review contains an invalid changed file');
   }
   if (/[\0]/.test(value.diff) || /(^|\n)\+\+\+ [A-Za-z]:[\\/]/.test(value.diff)) invalid('Local review diff contains an invalid path');
-  return {worktreePath:value.worktreePath,files:value.files.map(file=>({path:file.path,status:file.status})),diff:value.diff,diffTruncated:value.diffTruncated,filesTruncated:value.filesTruncated};
+  return {worktreePath:value.worktreePath,...(workspaceMode ? {workspaceMode} : {}),files:value.files.map(file=>({path:file.path,status:file.status})),diff:value.diff,diffTruncated:value.diffTruncated,filesTruncated:value.filesTruncated};
 }

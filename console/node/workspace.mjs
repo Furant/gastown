@@ -62,7 +62,7 @@ export async function ensureWorktree(project, taskId, { mustBeNew = false, allow
     ]);
     const expectedCommonDir = await git(project.repoPath, ['rev-parse', '--git-common-dir']);
     if (path.resolve(top) !== target || actualBranch !== branch || path.resolve(target, commonDir) !== path.resolve(project.repoPath, expectedCommonDir)) throw new Error('Existing task worktree does not match the requested project and branch');
-    return { path: target, branch, project, created: false };
+    return { path: target, branch, project, created: false, mode: 'worktree' };
   }
   if (await fs.lstat(target).then(() => true).catch(() => false)) throw new Error('Task worktree path exists and is not a directory');
   const branchExists = await git(project.repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]).then(() => true).catch(error => {
@@ -72,7 +72,27 @@ export async function ensureWorktree(project, taskId, { mustBeNew = false, allow
   if (mustBeNew && branchExists) throw new Error('Checkpoint target task branch already exists; refusing unrelated restore or replay');
   if (branchExists) await git(project.repoPath, ['worktree', 'add', target, branch]);
   else await git(project.repoPath, ['worktree', 'add', '-b', branch, target, project.baseBranch]);
-  return { path: target, branch, project, created: true };
+  return { path: target, branch, project, created: true, mode: 'worktree' };
+}
+
+export async function ensureInPlaceWorkspace(project, selectedBranch) {
+  if (typeof selectedBranch !== 'string' || !selectedBranch.trim() || selectedBranch !== project.baseBranch) throw new Error('Selected project branch does not match the configured node repository mapping');
+  await git(project.repoPath, ['check-ref-format', '--branch', selectedBranch]);
+  await git(project.repoPath, ['rev-parse', '--verify', `refs/heads/${selectedBranch}`]).catch(() => { throw new Error(`Selected branch is missing locally: ${selectedBranch}`); });
+  const [top, current, status, unmerged] = await Promise.all([
+    git(project.repoPath, ['rev-parse', '--show-toplevel']),
+    git(project.repoPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']).catch(() => ''),
+    git(project.repoPath, ['status', '--porcelain=v1', '--untracked-files=all']),
+    git(project.repoPath, ['diff', '--name-only', '--diff-filter=U'])
+  ]);
+  if (path.resolve(top) !== project.repoPath) throw new Error('Mapped project path is not the root of its Git repository');
+  if (!current) throw new Error('Local repository is detached; checkout the selected branch before running this task');
+  if (unmerged) throw new Error('Local repository has unmerged paths; resolve them before running this task');
+  if (current !== selectedBranch) {
+    if (status) throw new Error(`Local repository has uncommitted changes; clean the working tree before switching from ${current} to ${selectedBranch}`);
+    await git(project.repoPath, ['switch', '--no-overwrite-ignore', '--no-recurse-submodules', selectedBranch]);
+  }
+  return { path: project.repoPath, branch: selectedBranch, project, created: false, mode: 'in_place' };
 }
 
 export async function makeCheckpoint(worktree) {
@@ -81,7 +101,13 @@ export async function makeCheckpoint(worktree) {
     git(worktree.path, ['status', '--porcelain=v1', '--untracked-files=all'])
   ]);
   if (branch !== worktree.branch) throw new Error('Task branch changed unexpectedly; refusing to checkpoint');
+  if (worktree.mode === 'in_place') {
+    const top = await git(worktree.path, ['rev-parse', '--show-toplevel']);
+    if (path.resolve(top) !== worktree.project.repoPath) throw new Error('Local repository root changed unexpectedly; refusing to checkpoint');
+    const opaque = crypto.createHash('sha256').update(worktree.project.repoPath).digest('hex').slice(0, 20);
+    return { branch, worktree: `local-repository/${opaque}`, workspaceMode: 'in_place', dirty: Boolean(status) };
+  }
   const relative = path.relative(worktree.project.worktreesDir, worktree.path);
   if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Task worktree escaped its local storage');
-  return { branch, worktree: `node-worktrees/${relative}`, dirty: Boolean(status) };
+  return { branch, worktree: `node-worktrees/${relative}`, workspaceMode: 'worktree', dirty: Boolean(status) };
 }

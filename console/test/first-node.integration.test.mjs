@@ -120,9 +120,10 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   await runner.run((await client.poll({ capacity: 1 })).jobs[0]);
   const detail = (await api(`/tasks/${task.id}`)).data;
   assert.equal(detail.status, 'awaiting_review');
-  assert.ok(detail.localReview.worktreePath.startsWith(await realpath(worktreesDir)));
+  assert.equal(detail.workspaceMode,'in_place');assert.equal(detail.localReview.workspaceMode,'in_place');
+  assert.equal(detail.localReview.worktreePath,await realpath(repo));
   assert.match(detail.localReview.diff, /fixture task change/);
-  assert.equal(await readFile(join(repo, 'README.md'), 'utf8'), 'fixture base\n', 'the original project checkout remains untouched');
+  assert.equal(await readFile(join(repo, 'README.md'), 'utf8'), 'fixture task change', 'new local tasks edit the configured original directory');
   assert.match(await readFile(join(detail.localReview.worktreePath, 'README.md'), 'utf8'), /fixture task change/);
   const accepted = (await api(`/tasks/${task.id}/review`, { decision: 'accept', expectedGeneration: detail.reviewGeneration || 0 })).data;
   assert.equal(accepted.status, 'completed');

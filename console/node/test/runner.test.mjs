@@ -41,11 +41,50 @@ test('local execution is bound to this node and attaches a human review snapshot
   const reviewJob=job({repoType:'local',localPath:await fs.realpath(x.repo),localNodeId:'fixture-node'});
   const result=await x.runner.run(reviewJob),completed=x.events.find(event=>event.type==='completed');
   assert.equal(result.status,'completed');assert.equal(completed.data.localReview.worktreePath,await fs.realpath(result.worktree.path));
+  assert.equal(completed.data.localReview.workspaceMode,'worktree');
   assert.ok(completed.data.localReview.files.some(file=>file.path==='README.md'));assert.ok(completed.data.localReview.files.some(file=>file.path==='new-review.txt'));
   assert.match(completed.data.localReview.diff,/tracked-review-change/);assert.match(completed.data.localReview.diff,/untracked-review-change/);assert.equal(completed.data.localReview.diff.includes('fake-local-secret'),false);
   assert.equal(await fs.readFile(path.join(x.repo,'README.md'),'utf8'),'base');
   await assert.rejects(x.runner.run(job({taskId:'wrong-node-task',attemptId:'wrong-node-attempt',repoType:'local',localPath:x.repo,localNodeId:'remote-node'})),/bound local node/i);
   assert.equal(x.events.some(event=>event.attemptId==='wrong-node-attempt'&&event.type==='completed'),false);
+});
+
+test('new local in-place task runs in the configured repo and preserves pre-existing edits',async t=>{
+  const x=await setup(t,{type:'result',result:'Done'});x.runner.config.nodeId='fixture-node';
+  await fs.writeFile(path.join(x.repo,'README.md'),'already here\n');
+  const local=job({repoType:'local',workspaceMode:'in_place',baseBranch:execFileSync('git',['branch','--show-current'],{cwd:x.repo,encoding:'utf8'}).trim(),localPath:await fs.realpath(x.repo),localNodeId:'fixture-node'});
+  const result=await x.runner.run(local);
+  assert.equal(result.worktree.path,await fs.realpath(x.repo));assert.equal(result.worktree.mode,'in_place');
+  assert.equal(await fs.readFile(path.join(x.repo,'README.md'),'utf8'),'already here\n');
+  assert.equal(await fs.readdir(x.runner.config.worktreesDir).then(names=>names.length),0);
+  const complete=x.events.find(event=>event.type==='completed');assert.equal(complete.data.localReview.workspaceMode,'in_place');
+  assert.equal(complete.data.localReview.note.includes('pre-existing'),true);
+});
+
+test('in-place lock releases after a malformed plan is reported failed',async t=>{
+  const x=await setup(t,{type:'result',result:'not a JSON plan'});x.runner.config.nodeId='fixture-node';
+  const local={repoType:'local',workspaceMode:'in_place',baseBranch:execFileSync('git',['branch','--show-current'],{cwd:x.repo,encoding:'utf8'}).trim(),localPath:await fs.realpath(x.repo),localNodeId:'fixture-node'};
+  await assert.rejects(x.runner.run(job({...local,kind:'plan',taskId:'bad-plan',attemptId:'bad-plan-attempt'})),/valid JSON plan/i);
+  assert.ok(x.events.some(event=>event.attemptId==='bad-plan-attempt'&&event.type==='failed'));
+  const result=await x.runner.run(job({...local,taskId:'after-bad-plan',attemptId:'after-bad-plan-attempt'}));
+  assert.equal(result.status,'completed');
+});
+
+test('late stop acknowledgment releases the in-place lock after run settlement',async t=>{
+  const x=await setup(t,{type:'result',result:'Task done'});x.runner.config.nodeId='fixture-node';
+  let acknowledge,entered;const ackGate=new Promise(resolve=>acknowledge=resolve),stoppedEvent=new Promise(resolve=>entered=resolve);
+  const original=x.runner.client.event.bind(x.runner.client);
+  x.runner.client.event=async body=>{
+    if(body.type==='completed'&&body.attemptId==='late-stop-attempt'){const error=new Error('stop intent won completion race');error.status=409;error.code='stale_attempt';throw error}
+    if(body.type==='stopped'){entered();await ackGate}
+    return original(body);
+  };
+  const local={repoType:'local',workspaceMode:'in_place',baseBranch:execFileSync('git',['branch','--show-current'],{cwd:x.repo,encoding:'utf8'}).trim(),localPath:await fs.realpath(x.repo),localNodeId:'fixture-node'};
+  await assert.rejects(x.runner.run(job({...local,taskId:'late-stop',attemptId:'late-stop-attempt'})),/stop intent won/i);
+  const stopping=x.runner.cancel({attemptId:'late-stop-attempt',leaseToken:'opaque-lease',reason:'cancel'});
+  await stoppedEvent;acknowledge();await stopping;
+  const result=await x.runner.run(job({...local,taskId:'after-late-stop',attemptId:'after-late-stop-attempt'}));
+  assert.equal(result.status,'completed');
 });
 
 test('local execution rejects remote delivery and checkpoint metadata before spawn',async t=>{

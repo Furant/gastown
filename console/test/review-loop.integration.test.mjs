@@ -14,7 +14,7 @@ import { WorkerClient } from '../node/client.mjs';
 
 const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
 
-test('local review feedback preserves manual edits, runs again, and accepts without source integration', { timeout: 40000 }, async t => {
+test('local review feedback preserves manual edits, runs again, and accepts directly in the configured repository', { timeout: 40000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'console-review-loop-'));
   const repo = join(dir, 'repo'), worktreesDir = join(dir, 'worktrees');
   await mkdir(repo); await mkdir(worktreesDir);
@@ -74,12 +74,12 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   await runner.run((await client.poll({capacity:1})).jobs[0]);
   const detail = (await api(`/tasks/${task.id}`)).data;
   assert.equal(detail.status,'awaiting_review');
-  assert.ok(detail.localReview.worktreePath.startsWith(await realpath(worktreesDir)));
+  assert.equal(detail.localReview.worktreePath,await realpath(repo));assert.equal(detail.localReview.workspaceMode,'in_place');
   assert.ok(detail.localReview.files.some(file=>file.path==='README.md'));
   assert.ok(detail.localReview.files.some(file=>file.path==='added.txt'));
   assert.match(detail.localReview.diff,/reviewed task change/);
   const {readFile} = await import('node:fs/promises');
-  assert.equal(await readFile(join(repo,'README.md'),'utf8'),'fixture base\n');
+  assert.equal(await readFile(join(repo,'README.md'),'utf8'),'reviewed task change');
   assert.match(await readFile(join(detail.localReview.worktreePath,'README.md'),'utf8'),/reviewed task change/);
   const reviewPath=detail.localReview.worktreePath;
   await writeFile(join(reviewPath,'manual-review.txt'),'human IDE edit preserved');
@@ -96,7 +96,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
   const accepted=(await api(`/tasks/${task.id}/review`,{decision:'accept',expectedGeneration:revised.reviewGeneration})).data;
   assert.equal(accepted.status,'completed');
   assert.equal((await client.poll({capacity:1})).jobs.length,0);
-  assert.equal(await readFile(join(repo,'README.md'),'utf8'),'fixture base\n');
+  assert.equal(await readFile(join(repo,'README.md'),'utf8'),'second reviewed change');
   const duplicate=await fetch(base+`/api/v1/tasks/${task.id}/review`,{method:'POST',headers:{cookie,origin:base,'content-type':'application/json','x-csrf-token':csrf,'x-local-device':device},body:JSON.stringify({decision:'accept',expectedGeneration:accepted.reviewGeneration})});
   assert.equal(duplicate.status,409);
   const otherDevice = await fetch(base+'/api/v1/tasks/'+task.id,{headers:{cookie,'x-local-device':randomBytes(32).toString('hex')}});
